@@ -1,5 +1,161 @@
 # STATUS
 
+## Faz 7 — güvenilirlik ve kapanış hazırlığı: TAMAM (12 Eylül, 16:05 +03:00)
+
+**Teslimat:** `tools.py` (CLI yedeği), `terazi.py` (komisyonlu net PnL, gün sonu ayrı eylem, saat
+kapısı öne alındı, iki dayanıklılık düzeltmesi), `dashboard.py` + `static/index.html`
+("Kapanan işlemler" kartı + aktarım rozeti), `config.yaml` +3 anahtar, `docs/urun-mimari.md`.
+**Canlı ajana dokunulmadı, yeniden başlatılmadı** (PID 47492, 14:24:37'den beri). Tüm testler
+scratch dizinindeki izole sandbox kopyalarında, `--demo` veya `--dry-run` ile; canlı `logs/`,
+`state.json`, `control.json` hiç açılmadı, canlı `config.yaml`'a yalnız üç satır eklendi
+(`git diff config.yaml` → 3 insertion, 0 deletion).
+
+### 1) Komisyonlu net PnL — pozisyon başına
+- `fee_usdt()` / `fill_totals()`: dolumun komisyonunu USDT'ye çevirir. **Ölçülen gerçek** (demo
+  hesabın Faz 2 dolumları, `spot_get_fills`): OKX komisyonu **negatif** yazar ve **alışta BAZ
+  paradan** keser — `alış feeCcy="SOL" fee="-0.000117889"`, `satış feeCcy="USDT"
+  fee="-0.01199615406"`. Baz ise `fillPx` ile çevrilir, kote ise doğrudan alınır.
+- `Position.fee_paid` (USDT) eklendi, `state.json`'a serileşiyor. `_fill_summary` artık
+  `(sz, avg_px, fee)` döndürüyor; `_promote` girişte, `close_now` çıkışta dolduruyor.
+- **EXIT satırı** yeni alanlar: `exit_reason` (`tp|sl|tp_sl|time|eod|operator`), `gross_bps`,
+  `fee_bps`, `net_bps`, `net_pnl_usdt`, `fee_paid`, `fee_source` (`fills|estimated|none`).
+- **`state.json.closed_positions`**: parite, giriş, çıkış, sz, çıkış sebebi, net PnL; tavan
+  `execution.closed_positions_max` (50). Dashboard "Son emirler" kartı **"Kapanan işlemler"**
+  ile değiştirildi (boşsa "henüz kapanan işlem yok"); veri `/state`'ten geliyor, **yeni uç yok**.
+- **Ardışık kayıp/cooldown artık NET PnL'e bakıyor** — komisyonu yiyen bir "kazanç" sayacı
+  sıfırlamıyor.
+- **Uzlaştırmadaki TP/SL çıkışı artık fiyatlı:** eskiden `exit_px=None` ile kapanıyordu (canlıda
+  en sık görülecek çıkış budur, yani net PnL orada tamamen kördü). `_exit_from_fills()` satış
+  dolumlarından fiyat/miktar/komisyonu okur ve `pos.target`/`pos.stop`'a yakınlığa göre `tp`/`sl`
+  ayırır (borsa hangi bacağın tetiklendiğini ayrıca söylemiyor); dolum okunamazsa eski fiyatsız
+  davranış + `exit_reason="tp_sl"`.
+
+### 2) Gün sonu kapanışı — ayrı eylem, canlı doğrulandı
+`flatten_all(reason, exit_reason)` ve `close_now(pos, reason, exit_reason)` makine okunur sebep
+alıyor. Gün sonu dalı **`EOD_FLATTEN_DONE`** yazıyor (`OPERATOR_FLATTEN_DONE` değil — gün sonu
+operatör eylemi değil) ve `control.json`'daki `flatten` bayrağına **dokunmuyor**.
+
+### 3) Saat kapısı yargıçtan ÖNCE (kullanıcı onaylı)
+`_hour_gate()` çıkarıldı; `_handle_candidate` onu **0. kapı** olarak soruyor (mikro ve maliyetten
+de önce), `_risk_gate` 0. kontrol olarak **yine soruyor** — emre giden tek yol risk kapısıdır,
+hiçbir kapı çağıranın nezaketine bırakılmadı. Eskiden saat 10. kontroldü, yani 18:30–19:10
+arasında tetiklenen her aday önce LLM yargıcına gidip parası ödeniyordu. Gate adı **`risk_hour`
+kaldı** (spec §3.3 "time" diyor; `risk_*` deseni ve bugünün log tutarlılığı için değiştirilmedi).
+
+### 4) MCP → CLI yedeği, SADECE veri
+- `tools.CLI_FALLBACK` — **tam beş araç**: `market_get_candles|orderbook|trades|ticker`,
+  `account_get_balance`. Alt komutlar `okx market --help` / `okx account --help` çıktısından
+  alındı, **tahmin edilmedi**; global bayraklar modülden önce: `okx --profile <p> [--demo] --json
+  <modül> <eylem>`.
+- `_call` iki MCP denemesinde de düşerse `_cli_call` **tek deneme** yapar. CLI **çıplak dizi**
+  döndürüyor (üç uçta yeniden ölçüldü) → zarf soyma yok, sonuç MCP'nin `data.data`'sının yerine
+  geçiyor, metotların `rows[0]`/`_decimalize`/`reversed` sonrası aynı tipi dönüyor.
+- `_cli_call`'ın ilk iki satırı `assert`: emir aracı yedeğe **düşemez**, listede olmayan araç
+  yedeğe **giremez**. Modül düzeyinde de `CLI_FALLBACK.keys() & ORDER_TOOLS == set()` assert'i var.
+- `transport` artık sabit değil: karar satırlarında son çağrının aktarımı, **mikro satırlarında
+  yeni `transport` alanı**, `state.json`'da tur bazında toplam. Dashboard üst şeridinde
+  **aktarım rozeti** (mcp yeşil / cli_fallback turuncu) — `docs/urun-mimari.md` §4 bunu zaten
+  istiyordu, Faz 4'ten beri eksikti.
+
+### 5) Faz 7 sürprizleri (hepsi ölçüm, hepsi testte yakalandı)
+34. **MCP oturumu ölünce gelen istisna `OkxToolError` DEĞİL.** `mcp` SDK `MCPError: Connection
+    closed` atıyor; `_call`'ın dar `except OkxToolError`'ı bunu hiç görmüyordu — yani yedek
+    yazılsa bile **devreye girmezdi**. `_call` `except Exception`'a genişletildi
+    (`CancelledError` BaseException olduğu için etkilenmiyor).
+35. **Yedek çalışırken tur yine ölüyordu.** Mikro örnekleme CLI'dan devam ederken `reconcile`'ın
+    `spot_get_orders`'ı (yedeği **bilerek** yok) aynı `MCPError`'ı atıyor, oradaki dar `except`
+    de görmüyor → **tüm tur** düşüp 30 sn hata beklemesine giriyordu. Ölçüldü: örnekleme ritmi
+    20 sn'den 50 sn'ye çıkıyordu. `reconcile` ve `check_pending` handler'ları genişletildi;
+    uzlaştırma hatası artık tek `ERROR gate=reconcile` satırı, tur ölmüyor. Düzeltmeden sonra
+    BTC örnekleri **15:46:33 → :46:53 → :47:13 → :47:32 → :47:52**, yani 20 sn ritmi korunuyor.
+36. **Çökme kurtarması komisyonu ve giriş fiyatını ŞİŞİRİYORDU.** `_rebuild_position` paritedeki
+    **tüm** alış dolumlarını topluyordu; aynı paritede 4 eski dolum varken `fee_paid` 0,012
+    yerine **0,048**, giriş fiyatı da bulanık ortalama (102,1121) çıktı. Artık dolumlar en
+    yeniden geriye, algo emrinin miktarı dolana kadar alınıyor → `entry_px=102.14`,
+    `fee_paid=0.0120`. (Giriş fiyatındaki bulanıklık Faz 2'den beri vardı, komisyon onu görünür
+    yaptı.)
+37. **Market satışın komisyonu anında okunamıyor.** `spot_get_fills` çıkış emrini hemen
+    döndürmediği için ilk EXIT satırında `fee_bps` yalnız **giriş** komisyonunu taşıyordu; net PnL
+    sistematik olarak iyimser çıkıyordu (gidiş-dönüşün yarısı kayıp). Artık bilinen komisyon
+    oranıyla tahmin ediliyor ve satır `fee_source="estimated"` diye **damgalanıyor** — uydurma
+    değil, işaretli tahmin.
+38. **Uzlaştırma döngüsü bir pozisyonu atlıyordu:** `for pos in self.state.positions` gövdesinde
+    `_close_position` listeyi kısaltıyordu. `list(...)` ile kapatıldı. (Mevcut hata, Faz 7'de
+    görüldü.)
+
+### 6) Doğrulama — hepsi gerçek çıktı
+**T1 — gün sonu (sandbox-demo, `--demo`, eşikler şimdi+2 / şimdi+4 dk):**
+```
+15:33:05 CASH              "gün sonu 15:33"
+15:33:07 EXIT SOL-USDT  exit_reason=eod  gross_bps=6.84 fee_bps=10.0 net_bps=-3.16
+15:33:07 EOD_FLATTEN_DONE  "gün sonu kapanışı: 1 pozisyon kapatıldı, 0 bekleyen emir iptal edildi"
+```
+Zincir tam: `ORDER → FILL (fee_paid 0.0120) → cancel_algo → market sell → EXIT → EOD_FLATTEN_DONE`.
+`control.json` `flatten` bayrağı **false kaldı**. Brüt **artı**, net **eksi** — komisyon ölçümünün
+neden gerektiğinin ilk kanıtı. Sandbox config'i `diff` ile gösterildi, canlı config el değmedi.
+
+**T1b — saat kapısı yargıçtan önce (ayrı sandbox, `llm.enabled: true` AÇIK):**
+```
+15:35:45 REJECT gate=risk_hour "15:35 ≥ 15:34, yeni giriş yok"
+```
+`terazi.out`'ta **JUDGE satırı 0**, `llm.jsonl`'de tek satır var o da `task=regime`, `orders.jsonl`
+**hiç oluşmadı**. Aday yargıca gitmeden reddedildi.
+
+**T2 — CLI yedeği (sandbox, canlı profil, `--dry-run`):** ajanın MCP çocuğu `ppid` ile
+doğrulanarak (**canlı ajanın çocuğu 47494'e dokunulmadan**) `kill -9` edildi.
+```
+15:43:22 ETH-USDT transport=cli_fallback obi=0.020
+15:43:25 SOL-USDT transport=cli_fallback obi=-0.074
+15:43:27 XRP-USDT transport=cli_fallback obi=0.213
+```
+Gerçek değerler geliyor (sıfır/null değil). `state.json transport=cli_fallback`, karar satırları
+da öyle; **"HATA turda" sayısı 0**; 35 mikro satırının 10'u mcp, 25'i cli_fallback.
+Sınır doğrudan gösterildi: `spot_place_order` ve `spot_cancel_algo_order` → *"emir çağrısı CLI
+yedeğine DÜŞEMEZ"*, `news_get_by_coin` → *"CLI yedeği tanımlı değil"*, `market_get_ticker` CLI'dan
+`last = 77341.7` döndü.
+
+**T3 — çökme kurtarma + fee (sandbox-demo):** pozisyon açıkken `SIGKILL`.
+- `state.json` **silinerek** yeniden başlatma → `KURTARMA SOL-USDT: sz=0.117367 entry=102.14
+  algoId=3916308511781253126`, `fee_paid=0.01199991790` — üçü de yalnızca borsadan kuruldu.
+- `state.json` **korunarak** yeniden başlatma → aynı `algoId/sz/entry/fee_paid` dosyadan geri geldi.
+- Sonra operatör flatten ile demo pozisyonu kapatıldı: `EXIT ... net=-31.71bps (operator)`,
+  `closed_positions` kaydı `fee_source="estimated"` damgalı.
+
+**Ekran (Playwright, 1440×900, sandbox verisiyle):** **JS hatası YOK**, `scrollWidth/Height ==
+innerWidth/Height`. Üst şeritte 8. kart **"AKTARIM mcp"** (yeşil); "Kapanan işlemler" kartı
+`15:56:10 SOL-USDT −31.71 bps −0.038008 USDT [operator]`; karar akışında `OPERATOR_FLATTEN_DONE`
+ve `EXIT` rozetleri. Boş durum ayrıca canlı dashboard'da görüldü: "henüz kapanan işlem yok".
+
+### Faz 7'de bilinçli bırakılanlar / açık işler
+- **Açılışta MCP hiç kalkmazsa ajan yine başlamaz** (kullanıcı kararı, süre): yedek yalnız
+  **oturum içi** düşüşü kapsıyor. Degraded-start modu (oturumsuz, sadece CLI) yazılmadı.
+- **`fee_source="estimated"` maker oranını kullanıyor** (`account_get_trade_fee.maker`, 8 bps);
+  market çıkışı gerçekte taker (10 bps). Tahmin ~2 bps iyimser. Kesin değer bir sonraki
+  uzlaştırmada dolumdan okunabilir — yapılmadı.
+- **TP/SL ayrımı fiyat yakınlığıyla** yapılıyor; borsa hangi bacağın tetiklendiğini söylemiyor.
+  `spot_get_algo_orders(--history)` kesin cevabı verebilir, denenmedi.
+- Faz 6'nın açık işleri **duruyor**: `config.yaml`'a `llm: ask:` bloğu ve dashboard sabitlerinin
+  (`LLM_PANEL_ROWS / MICRO_WINDOW_MIN / EQUITY_MAX_POINTS`) config'e taşınması.
+- `GET /orders` ucu duruyor ama **dashboard artık çağırmıyor** (kart state.json'dan besleniyor).
+- Gün devri (`trade_day`) hâlâ uygulanmadı — yarışma tek gün.
+- ATK araç sayacı kartı (spec §4) Faz 8'e.
+
+### ⚠️ YENİDEN BAŞLATMA — SENDE, TEK SEFER
+Bu restart Faz 7'nin tamamını **ve** Faz 6'da bekleyen `judge._two_sentences` düzeltmesini canlıya
+taşır. Önce kontrol: `.env` proje kökünde (`ANTHROPIC_API_KEY` + `ANTHROPIC_WORKSPACE_ID`),
+`config.yaml`'da `llm.enabled: true`, `demo_test.enabled: false`, `rsi_setup_threshold: 36`.
+```bash
+cd /Users/osmancanbozali/Desktop/terazi
+# 1) ajanı temiz durdur (pozisyonlar borsadaki TP/SL ile korunur):
+echo '{"mode":"kill","flatten":false}' > control.json
+#    logs/terazi.out'ta "OPERATÖR KILL: ajan temiz çıkıyor." göründükten sonra:
+# 2) ajanı başlat (açılışta mode=kill bir kerelik tüketilir → run):
+nohup .venv/bin/python -u terazi.py --profile hackathon > logs/terazi.out 2>&1 & disown
+# 3) dashboard da değişti (ACTIONS + index.html) — onu da yenile:
+pkill -f "uvicorn dashboard:app"
+nohup .venv/bin/uvicorn dashboard:app --port 8787 > logs/dashboard.out 2>&1 & disown
+```
+
 ## Faz 6 — "Ajana sor" + LLM paneli + equity eğrisi + mikro sparkline: TAMAM (12 Eylül, 15:05 +03:00)
 
 **Teslimat:** `ask.py` (yeni), `dashboard.py` +4 uç, `static/index.html` (yeniden yazıldı),
@@ -58,11 +214,11 @@ Karar akışı satırlarına `llm` verdict rozeti eklendi. Chart'lar **bir kez**
 `"BTC son 24 saattir 77. 000-77."` diye kesiyordu. Cümle sayısı zaten `REGIME_SYSTEM`'de
 isteniyor; kod artık yalnızca `_clip(reason_max_chars)` uyguluyor.
 
-> ### ⚠️ DİSK ≠ CANLI SÜREÇ
-> Çalışan ajan `judge.py`'yi **açılışta** import etti; diskteki düzeltme belleğe girmedi.
-> 15:00'te üretilen not hâlâ kesik: `"Fiyat son saatlerde 77. 0-77."`. **Düzeltme Faz 7'deki
-> yeniden başlatmayla canlıya girer** (kullanıcı kararı: kozmetik için ajan durdurulmuyor).
-> O zamana kadar LLM paneli ve rejim satırı kesik notu göstermeye devam eder.
+> ### ✅ KAPANDI (Faz 7)
+> ~~DİSK ≠ CANLI SÜREÇ~~ — çalışan ajan `judge.py`'yi açılışta import etmişti, diskteki düzeltme
+> belleğe girmemişti (15:00'te üretilen not hâlâ kesikti: `"Fiyat son saatlerde 77. 0-77."`).
+> Kod değişikliği gerekmedi; **Faz 7'nin tek yeniden başlatması bu düzeltmeyi de canlıya taşıyor.**
+> Restart komutu Faz 7 bölümünün sonunda.
 
 ### Faz 6 sürprizleri (hepsi ölçüm)
 29. **Token tahmini 2× yanlıştı.** 3,5 karakter/token varsayımı bu bağlamda **1,81** çıktı
@@ -437,9 +593,10 @@ uygulanmadı — yarışma tek gün olduğu için bugün etkisi yok. Ajan gece y
 gün başı equity dünden kalır.
 
 ## Şu anki faz
-**Faz 6 — "Ajana sor" + LLM paneli + equity + sparkline: TAMAM** (12 Eylül 2026, 15:05 +03:00).
-Sıradaki: **Faz 7 — güvenilirlik** (MCP→CLI yedeği, çökme kurtarma, gün sonu kapanışı demoda).
-Faz 7'deki tek yeniden başlatma `judge.py` not düzeltmesini de canlıya taşıyacak.
+**Faz 7 — güvenilirlik ve kapanış hazırlığı: TAMAM** (12 Eylül 2026, 16:05 +03:00).
+**Bekleyen tek iş: kullanıcının yapacağı TEK yeniden başlatma** (komut Faz 7 bölümünün sonunda);
+Faz 6'nın `judge.py` düzeltmesi de onunla canlıya girer.
+Sıradaki: **Faz 8 — `report.py` + README + sunum** (hedef 17:15). **Kod donma saati 17:30.**
 
 **Faz 2 — `terazi.py` + `tools.py` MVP: TAMAM** (12 Eylül 2026, 09:07 UTC).
 Demo'da bir emir uçtan uca geçti: giriş → dolum → `algoId` yakalama → kurtarma → kapatma.

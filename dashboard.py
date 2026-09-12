@@ -55,7 +55,8 @@ EQUITY_MAX_POINTS = 400   # equity eğrisinde çizilecek en fazla nokta (seyrelt
 # decisions.jsonl'de görülebilen action değerleri (docs/urun-mimari.md §3.3).
 # OPERATOR_* tek kovada toplanır: ajan mode değişiminde OPERATOR_RUN yazarken spec
 # OPERATOR_RESUME diyor, ayrıca OPERATOR_KILL_CLEARED var — hepsi aynı sayaca girer.
-ACTIONS = ("WAIT", "SETUP", "CANDIDATE", "REJECT", "ORDER", "FILL", "EXIT", "CASH", "ERROR")
+ACTIONS = ("WAIT", "SETUP", "CANDIDATE", "REJECT", "ORDER", "FILL", "EXIT", "CASH", "ERROR",
+           "EOD_FLATTEN_DONE")  # gün sonu kapanışı operatör eylemi DEĞİL, kendi sayacı var (Faz 7)
 
 
 # ----------------------------------------------------------------------------

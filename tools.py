@@ -11,16 +11,21 @@ Emir güvenlik kapısı: her `spot_place_order` öncesi yanıtlardan okunan `cap
 `expected_demo` ile karşılaştırılır. Eşleşmezse emir GÖNDERİLMEZ, `SafetyGateError` atılır.
 `dry_run=True` ise emir araçları MCP'ye hiç gitmez.
 
-Bu dosyada BİLEREK yok:
-  - CLI yedeği — Faz 7 (docs/urun-mimari.md §3.2)
+CLI yedeği (Faz 7, docs/urun-mimari.md §3.2): bir MCP çağrısı iki denemede de düşerse aynı istek
+`okx <modül> <eylem> --json` ile denenir ve `last_transport` `"cli_fallback"` olur. Yedek YALNIZCA
+`CLI_FALLBACK`'teki beş VERİ aracı için vardır; emir/algo/news/smartmoney araçlarında yoktur ve
+`_cli_call` bunu assert ile zorlar (çift emir riski + CLI çıktısında `capabilities.demo` yok,
+yani güvenlik kapısı yedekten beslenemez).
 
-Araç adları `docs/mcp-araclari.md`'den alınmıştır; tahmin edilmemiştir.
+Araç adları `docs/mcp-araclari.md`'den, CLI alt komutları `okx <modül> --help` çıktısından
+alınmıştır; ikisi de tahmin edilmemiştir.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from contextlib import AsyncExitStack
 from decimal import Decimal, InvalidOperation
 from types import TracebackType
@@ -71,6 +76,57 @@ ORDER_TOOLS: frozenset[str] = frozenset(
 
 DATA_ATTEMPTS = 2  # veri çağrısı deneme sayısı
 RETRY_BACKOFF_SEC = 0.5  # 1. hata sonrası bekleme; her denemede ikiye katlanır
+
+
+class NoCliMapping(RuntimeError):
+    """Bu çağrının CLI karşılığı yok → yedek denenmez, MCP hatası aynen yükselir."""
+
+
+def _cli_candles(a: dict[str, Any]) -> list[str]:
+    if "after" in a:  # `okx market candles` --after kabul etmiyor (okx market --help)
+        raise NoCliMapping("market_get_candles: 'after' CLI'da yok")
+    argv = ["market", "candles", str(a["instId"])]
+    if a.get("bar"):
+        argv += ["--bar", str(a["bar"])]
+    if a.get("limit"):
+        argv += ["--limit", str(a["limit"])]
+    return argv
+
+
+def _cli_orderbook(a: dict[str, Any]) -> list[str]:
+    argv = ["market", "orderbook", str(a["instId"])]
+    if a.get("sz"):
+        argv += ["--sz", str(a["sz"])]
+    return argv
+
+
+def _cli_trades(a: dict[str, Any]) -> list[str]:
+    argv = ["market", "trades", str(a["instId"])]
+    if a.get("limit"):
+        argv += ["--limit", str(a["limit"])]
+    return argv
+
+
+def _cli_ticker(a: dict[str, Any]) -> list[str]:
+    return ["market", "ticker", str(a["instId"])]
+
+
+def _cli_balance(a: dict[str, Any]) -> list[str]:
+    return ["account", "balance", str(a["ccy"])] if a.get("ccy") else ["account", "balance"]
+
+
+# MCP aracı → `okx` CLI argv çevirisi. Alt komutlar `okx market --help` / `okx account --help`
+# çıktısından alındı, TAHMİN DEĞİL. Bu sözlükte OLMAYAN hiçbir araç yedeğe düşemez:
+# emir/algo araçları (çift emir riski), news/smartmoney (yargıç girdisi, düşerse missing_inputs
+# yolu zaten var). Beş veri aracı — docs/urun-mimari.md §3.2.
+CLI_FALLBACK: dict[str, Any] = {
+    "market_get_candles": _cli_candles,
+    "market_get_orderbook": _cli_orderbook,
+    "market_get_trades": _cli_trades,
+    "market_get_ticker": _cli_ticker,
+    "account_get_balance": _cli_balance,
+}
+assert not (CLI_FALLBACK.keys() & ORDER_TOOLS), "emir aracı CLI yedeğine giremez"
 
 # Sayısala çevrilmeyecek alanlar: kimlikler, zaman damgaları, enum'lar.
 # Bunlar rakamdan ibaret olsa bile string kalmalı (ts'i Decimal yapmak indekslemeyi bozar).
@@ -201,18 +257,28 @@ class OkxTools:
         command: str = "okx-trade-mcp",
         expected_demo: bool | None = None,
         dry_run: bool = False,
+        cli_fallback: bool = False,
+        cli_timeout_sec: float = 15.0,
+        cli_command: str = "okx",
     ) -> None:
         args = ["--profile", profile, "--modules", modules]
         if demo:
             args.append("--demo")
         self._params = StdioServerParameters(command=command, args=args)
         self._profile = profile
+        self._demo_flag = demo
         self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
         self._demo: bool | None = None
         # Güvenlik kapısı: None = kapı kapalı, emir aracı çağrılırsa reddedilir.
         self._expected_demo = expected_demo
         self._dry_run = dry_run
+        # CLI yedeği (Faz 7). Varsayılan KAPALI: ask.py ve calibrate.py davranışı değişmez.
+        self._cli_fallback = cli_fallback
+        self._cli_timeout = cli_timeout_sec
+        self._cli_command = cli_command
+        self.last_transport = "mcp"  # son çağrının aktarımı; çağıran loglar
+        self.fallback_count = 0  # oturum boyunca CLI'ya düşen çağrı sayısı
 
     # ---- oturum ----
 
@@ -260,6 +326,9 @@ class OkxTools:
 
         `attempts`: veri çağrıları için 2 (üssel bekleme). EMİR araçları için 1 olmak ZORUNDA —
         assert bunu zorlar, yorumla bırakılmaz (CLAUDE.md: emir çağrılarında retry YOK).
+
+        İki deneme de düşerse ve araç `CLI_FALLBACK`'teyse aynı istek `okx ... --json` ile
+        BİR KEZ denenir (Faz 7). Emir araçlarında bu yol `_cli_call`'daki assert ile kapalıdır.
         """
         if tool in ORDER_TOOLS:
             assert attempts == 1, f"{tool}: emir çağrısında yeniden deneme yasak (attempts={attempts})"
@@ -267,15 +336,54 @@ class OkxTools:
             raise RuntimeError("OkxTools oturumu açık değil; 'async with' içinde kullan.")
 
         delay = RETRY_BACKOFF_SEC
+        last_exc: Exception = AssertionError("ulaşılamaz")
         for attempt in range(1, attempts + 1):
             try:
-                return await self._call_once(tool, args)
-            except OkxToolError:
-                if attempt == attempts:
-                    raise
-                await asyncio.sleep(delay)
-                delay *= 2
-        raise AssertionError("ulaşılamaz")
+                out = await self._call_once(tool, args)
+                self.last_transport = "mcp"
+                return out
+            except Exception as exc:  # noqa: BLE001
+                # OkxToolError'dan GENİŞ: oturum koparsa mcp SDK McpError/ClosedResourceError
+                # atıyor ve dar `except` bunları hiç görmüyordu — yedek de devreye girmezdi.
+                # CancelledError BaseException olduğu için buraya düşmez.
+                last_exc = exc
+                if attempt < attempts:
+                    await asyncio.sleep(delay)
+                    delay *= 2
+
+        if self._cli_fallback and tool in CLI_FALLBACK:
+            try:
+                out = await self._cli_call(tool, args)
+            except NoCliMapping:
+                raise last_exc from None
+            except Exception as cli_exc:  # noqa: BLE001
+                raise OkxToolError(tool, f"MCP düştü ({last_exc}); CLI yedeği de düştü ({cli_exc})") from cli_exc
+            self.last_transport = "cli_fallback"
+            self.fallback_count += 1
+            return out
+        raise last_exc
+
+    async def _cli_call(self, tool: str, args: dict[str, Any]) -> Any:
+        """MCP yedeği: aynı isteği `okx ... --json` ile TEK KEZ dene.
+
+        CLI çıplak dizi döndürür (MCP'nin `payload["data"]["data"]`'sıyla birebir aynı içerik,
+        zarf yok — docs/mcp-araclari.md §5, 12 Eylül'de üç uçta yeniden ölçüldü), o yüzden
+        soyma yok: dönen değer doğrudan `_call_once`'ın döndürdüğünün yerine geçer.
+        """
+        assert tool not in ORDER_TOOLS, f"{tool}: emir çağrısı CLI yedeğine DÜŞEMEZ"
+        assert tool in CLI_FALLBACK, f"{tool}: CLI yedeği tanımlı değil"
+
+        argv = [self._cli_command, "--profile", self._profile]
+        if self._demo_flag:
+            argv.append("--demo")
+        argv += ["--json", *CLI_FALLBACK[tool](args)]
+
+        proc = await asyncio.to_thread(
+            subprocess.run, argv, capture_output=True, text=True, timeout=self._cli_timeout
+        )
+        if proc.returncode != 0:
+            raise OkxToolError(tool, f"okx CLI çıkış kodu {proc.returncode}: {proc.stderr.strip()[:200]}")
+        return json.loads(proc.stdout)
 
     async def _call_once(self, tool: str, args: dict[str, Any]) -> Any:
         assert self._session is not None

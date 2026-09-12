@@ -49,7 +49,7 @@ MICRO = LOGS / "micro.jsonl"
 STATE = Path("state.json")
 CONTROL = Path("control.json")
 
-TRANSPORT = "mcp"  # CLI yedeği Faz 7; o zamana kadar sabit
+TRANSPORT = "mcp"  # başlangıç aktarımı; Faz 7'den beri çalışma anında değişir (CLI yedeği)
 
 
 # ----------------------------------------------------------------------------
@@ -238,6 +238,37 @@ class Regime:
         return True, ""
 
 
+def fee_usdt(pair: str, fill: dict[str, Any]) -> Decimal:
+    """Bir dolumun komisyonunu USDT'ye çevir.
+
+    OKX komisyonu NEGATİF yazar ve ALIŞTA BAZ PARADAN keser — 12 Eylül'de demo hesaptaki gerçek
+    dolumlarla ölçüldü, tahmin değil:
+      alış : feeCcy="SOL"  fee="-0.000117889"  → USDT = 0.000117889 × fillPx
+      satış: feeCcy="USDT" fee="-0.01199615406" → USDT = 0.01199615406
+    Tanınmayan komisyon parasında 0 döner (net PnL'i uydurmaktansa eksik bırak).
+    """
+    fee = abs(Decimal(str(fill.get("fee") or 0)))
+    if fee == 0:
+        return Decimal(0)
+    ccy, (base, quote) = str(fill.get("feeCcy") or ""), pair.split("-")
+    if ccy == quote:
+        return fee
+    if ccy == base:
+        return fee * Decimal(str(fill.get("fillPx") or 0))
+    return Decimal(0)
+
+
+def fill_totals(pair: str, fills: list[dict[str, Any]]) -> tuple[Decimal, Decimal, Decimal]:
+    """Dolum listesinden (toplam miktar, ağırlıklı ortalama fiyat, komisyon USDT)."""
+    total = cost = fee = Decimal(0)
+    for f in fills:
+        sz = Decimal(str(f.get("fillSz") or 0))
+        total += sz
+        cost += sz * Decimal(str(f.get("fillPx") or 0))
+        fee += fee_usdt(pair, f)
+    return total, (cost / total if total else Decimal(0)), fee
+
+
 def cost_gate(target_bps: float, fee_bps: float, spread: float, mult: float) -> tuple[bool, str]:
     cost = 2 * fee_bps + spread
     need = mult * cost
@@ -262,6 +293,7 @@ class Position:
     opened_ms: int
     bars_held: int = 0
     algo_id: str | None = None
+    fee_paid: Decimal = Decimal(0)  # girişte ödenen komisyon, USDT (Faz 7)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -269,6 +301,7 @@ class Position:
             "entry_px": str(self.entry_px), "sz": str(self.sz),
             "target": str(self.target), "stop": str(self.stop),
             "opened_ms": self.opened_ms, "bars_held": self.bars_held, "algo_id": self.algo_id,
+            "fee_paid": str(self.fee_paid),
         }
 
     @classmethod
@@ -278,6 +311,7 @@ class Position:
             entry_px=Decimal(d["entry_px"]), sz=Decimal(d["sz"]),
             target=Decimal(d["target"]), stop=Decimal(d["stop"]),
             opened_ms=d["opened_ms"], bars_held=d.get("bars_held", 0), algo_id=d.get("algo_id"),
+            fee_paid=Decimal(d.get("fee_paid", "0")),
         )
 
 
@@ -331,6 +365,8 @@ class State:
     transport: str = TRANSPORT
     vol_ban_until_ms: int = 0  # dashboard sarı rozeti buradan okur (Faz 5)
     regime_commentary: dict[str, Any] | None = None  # LLM rejim yorumu (30 dk)
+    # Kapanan işlemler, en yeni SONDA; komisyonlu net PnL ile (Faz 7). Dashboard kartı buradan okur.
+    closed_positions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -352,6 +388,7 @@ class State:
             "transport": self.transport,
             "vol_ban_until_ms": self.vol_ban_until_ms,
             "regime_commentary": self.regime_commentary,
+            "closed_positions": self.closed_positions,
         }
 
     @classmethod
@@ -375,6 +412,7 @@ class State:
             trade_day=d.get("trade_day", ""),
             vol_ban_until_ms=int(d.get("vol_ban_until_ms") or 0),
             regime_commentary=d.get("regime_commentary"),
+            closed_positions=list(d.get("closed_positions") or []),
         )
         dse = d.get("day_start_equity")
         st.day_start_equity = Decimal(dse) if dse else None
@@ -495,7 +533,7 @@ class Agent:
             "daily_pnl_pct": round(self.state.daily_pnl_pct, 4),
             "open_positions": len(self.state.positions),
             "regime": self.regime.level,
-            "transport": TRANSPORT,
+            "transport": self.t.last_transport,  # son araç çağrısının aktarımı (Faz 7)
         }
         row.update(fields)
         append_jsonl(DECISIONS, row)
@@ -683,12 +721,15 @@ class Agent:
 
     async def sample_micro(self) -> None:
         for pair in self.pairs:
+            fb0 = self.t.fallback_count
             book = await self.t.get_orderbook(pair, sz=self.cfg.micro.orderbook_sz)
             trades = await self.t.get_trades(pair, limit=self.cfg.micro.trades_limit)
             sp = spread_bps(book)
             row = {
                 "ts": datetime.now(tz=self.tz).isoformat(timespec="seconds"),
                 "symbol": pair,
+                # İki çağrıdan biri bile CLI'ya düştüyse örnek cli_fallback sayılır (Faz 7).
+                "transport": "cli_fallback" if self.t.fallback_count > fb0 else "mcp",
                 "obi": obi(book, self.cfg.micro.obi_band_bps),
                 "tfi": tfi(trades, self.cfg.micro.tfi_window_sec),
                 "spread_bps": None if sp is None else round(sp, 4),
@@ -912,6 +953,13 @@ class Agent:
         }
         self.decide("CANDIDATE", reason="tetik geldi, kapılara giriyor", **base)
 
+        # 0) saat — en ucuz kapı en başta. Risk kapısında da duruyor (aşılamaz katman orası),
+        # ama burada sorulmazsa 18:30 sonrası her aday boşuna LLM yargıcına gidiyor (Faz 7).
+        ok, reason = self._hour_gate()
+        if not ok:
+            self.decide("REJECT", gate="risk_hour", reason=reason, **base)
+            return False
+
         # 1) mikro teyit
         ok, reason = self._micro_confirm(pair)
         if not ok:
@@ -961,6 +1009,13 @@ class Agent:
                            f"{self.cfg.micro.spread_mult_max:g}× medyan {med:.2f}bps")
         return True, f"OBI {m['obi']:.3f}, spread {m['spread_bps']:.2f}bps"
 
+    def _hour_gate(self) -> tuple[bool, str]:
+        """`last_entry_local` (18:30) sonrası yeni giriş yok. Gerekçe Türkçe ve saatli."""
+        local = datetime.now(tz=self.tz)
+        if local.time() >= parse_hhmm(self.cfg.execution.last_entry_local):
+            return False, f"{local:%H:%M} ≥ {self.cfg.execution.last_entry_local}, yeni giriş yok"
+        return True, ""
+
     async def _risk_gate(
         self, pair: str, stop_bps: float, orders_allowed: bool, size_mult: float = 1.0
     ) -> tuple[bool, str, str, Decimal, Decimal]:
@@ -974,6 +1029,13 @@ class Agent:
 
         if not orders_allowed:
             return False, "control", "operatör: emir yok (pause/kill)", zero, zero
+
+        # 0 saat — EN BAŞTA (Faz 7). Eskiden 10. kontroldü. Aday akışı bunu artık yargıçtan ÖNCE
+        # de soruyor (`_handle_candidate`), ama kontrol burada da duruyor: emre giden tek yol
+        # risk kapısıdır, hiçbir kapı yalnızca çağıranın nezaketine bırakılmaz.
+        ok, why = self._hour_gate()
+        if not ok:
+            return False, "risk_hour", why, zero, zero
 
         # 1 kill switch — YALNIZCA günlük zarar. Bayrağın tek yazarı burasıdır; operatör kill
         # (tick()) artık buraya yazmaz. İkisi ayrı kavram: bu "bugün bitti" (kalıcı risk kararı),
@@ -1032,12 +1094,6 @@ class Agent:
         avail = await self.t.get_avail_bal("USDT")
         if px * sz > avail:
             return False, "risk_balance", f"notional {px * sz:.2f} > availBal {avail}", zero, zero
-        # 10 saat
-        local = datetime.now(tz=self.tz)
-        if local.time() >= parse_hhmm(self.cfg.execution.last_entry_local):
-            return False, "risk_hour", \
-                f"{local:%H:%M} ≥ {self.cfg.execution.last_entry_local}, yeni giriş yok", zero, zero
-
         note = f"10 kontrol geçti" + (f" (LLM REDUCE ×{size_mult:g})" if size_mult < 1.0 else "")
         return True, "", note, sz, px
 
@@ -1123,9 +1179,9 @@ class Agent:
         for po in list(self.state.pending):
             try:
                 od = await self.t.get_order(po.pair, ord_id=po.ord_id)
-            except OkxToolError as exc:
+            except Exception as exc:  # noqa: BLE001 — reconcile ile aynı gerekçe (Faz 7)
                 self.decide("ERROR", symbol=po.pair, gate="reconcile",
-                            reason=f"emir sorgusu başarısız: {exc.detail}")
+                            reason=f"emir sorgusu başarısız: {getattr(exc, 'detail', exc)}")
                 continue
             state = str(od.get("state", ""))
             filled = Decimal(str(od.get("accFillSz") or 0))
@@ -1150,7 +1206,7 @@ class Agent:
 
     async def _promote(self, po: PendingOrder, od: dict[str, Any], filled: Decimal) -> None:
         """Dolan emri pozisyona çevir. GERÇEK miktar fills'ten gelir (kısmi dolum olabilir)."""
-        real_sz, avg_px = await self._fill_summary(po.pair, po.ord_id)
+        real_sz, avg_px, fee = await self._fill_summary(po.pair, po.ord_id)
         if real_sz <= 0:
             real_sz = filled
             avg_px = Decimal(str(od.get("avgPx") or po.px))
@@ -1158,30 +1214,23 @@ class Agent:
             self.state.pending.remove(po)
         pos = Position(pair=po.pair, ord_id=po.ord_id, cl_ord_id=po.cl_ord_id,
                        entry_px=avg_px, sz=real_sz, target=po.target, stop=po.stop,
-                       opened_ms=now_ms())
+                       opened_ms=now_ms(), fee_paid=fee)
         pos.algo_id = await self._find_algo_id(po.pair)
         self.state.positions.append(pos)
         partial = "" if real_sz >= po.sz else f" (KISMİ: {dstr(real_sz)}/{dstr(po.sz)})"
         self.decide("FILL", symbol=po.pair, price=float(avg_px), sz=dstr(real_sz),
-                    algo_id=pos.algo_id, ord_id=po.ord_id,
+                    algo_id=pos.algo_id, ord_id=po.ord_id, fee_paid=float(fee),
                     reason=f"dolum {dstr(real_sz)} @ {dstr(avg_px)}{partial}; "
-                           f"algoId={pos.algo_id or 'YOK'}")
+                           f"komisyon {fee:.6f} USDT; algoId={pos.algo_id or 'YOK'}")
         print(f"FILL {po.pair} {dstr(real_sz)} @ {dstr(avg_px)} algoId={pos.algo_id}")
 
-    async def _fill_summary(self, pair: str, ord_id: str) -> tuple[Decimal, Decimal]:
-        """Dolumlardan gerçek miktar ve ağırlıklı ortalama fiyat."""
+    async def _fill_summary(self, pair: str, ord_id: str) -> tuple[Decimal, Decimal, Decimal]:
+        """Dolumlardan gerçek miktar, ağırlıklı ortalama fiyat ve KOMİSYON (USDT)."""
         try:
             fills = await self.t.get_fills(inst_id=pair, ord_id=ord_id)
         except OkxToolError:
-            return Decimal(0), Decimal(0)
-        total = Decimal(0)
-        cost = Decimal(0)
-        for f in fills:
-            sz = Decimal(str(f.get("fillSz") or 0))
-            px = Decimal(str(f.get("fillPx") or 0))
-            total += sz
-            cost += sz * px
-        return total, (cost / total if total else Decimal(0))
+            return Decimal(0), Decimal(0), Decimal(0)
+        return fill_totals(pair, fills)
 
     async def _find_algo_id(self, pair: str) -> str | None:
         """İliştirilmiş TP/SL'in algoId'si — çıkışı iptal etmenin tek yolu."""
@@ -1201,8 +1250,13 @@ class Agent:
         try:
             open_orders = await self.t.get_orders(status="open")
             algos = await self.t.get_algo_orders(status="pending")
-        except OkxToolError as exc:
-            self.decide("ERROR", gate="reconcile", reason=f"uzlaştırma okunamadı: {exc.detail}")
+        except Exception as exc:  # noqa: BLE001
+            # OkxToolError'dan GENİŞ (Faz 7): MCP oturumu ölürse bu araçların CLI yedeği YOK
+            # (emir yüzeyi) ve gelen MCPError dar `except`e takılmayıp TÜM TURU düşürüyordu —
+            # mikro örnekleme yedekten çalışırken tur 30 sn'lik hata beklemesine giriyordu.
+            # Uzlaştırmanın başarısızlığı turu öldürmez; bir sonraki turda yeniden denenir.
+            detail = getattr(exc, "detail", exc)
+            self.decide("ERROR", gate="reconcile", reason=f"uzlaştırma okunamadı: {detail}")
             return
 
         live_ords = {str(o.get("ordId")) for o in open_orders}
@@ -1227,7 +1281,9 @@ class Agent:
                                        f"emir borsada yok, dolum 0 (state={od.get('state')})")
 
         # Pozisyonların algoId'sini borsadan tazele; yoksa çıkış emri düşmüş demektir.
-        for pos in self.state.positions:
+        # list(): gövde _close_position ile listeyi kısaltıyor, canlı liste üzerinde dönmek
+        # bir pozisyonu atlar (Faz 7'de görüldü).
+        for pos in list(self.state.positions):
             live_algo = algo_by_pair.get(pos.pair)
             if live_algo and pos.algo_id != live_algo:
                 self.decide("FILL", symbol=pos.pair, algo_id=live_algo,
@@ -1235,10 +1291,16 @@ class Agent:
                                    f"({pos.algo_id or 'YOK'} → {live_algo})")
                 pos.algo_id = live_algo
             elif not live_algo and pos.algo_id:
-                # TP/SL tetiklenmiş olabilir → pozisyon kapanmış say, bakiye doğrular.
-                self.decide("EXIT", symbol=pos.pair, reason="algo emri borsada yok: TP/SL çalıştı",
-                            algo_id=pos.algo_id)
-                self._close_position(pos, exit_px=None)
+                # TP/SL tetiklenmiş → pozisyon kapandı. Çıkış fiyatını, miktarını ve komisyonu
+                # SATIŞ DOLUMLARINDAN oku; hangisinin çalıştığını (tp/sl) fiyata bakarak ayır.
+                # Canlıda en sık görülecek çıkış bu; fiyatsız kapatmak net PnL'i kör bırakıyordu.
+                exit_px, exit_fee, why = await self._exit_from_fills(pos)
+                src = "fills" if exit_px is not None else "none"
+                pnl = self._close_position(pos, exit_px, why, exit_fee, src)
+                self.decide("EXIT", symbol=pos.pair, algo_id=pos.algo_id, exit_reason=why,
+                            price=None if exit_px is None else float(exit_px),
+                            price_source=src, fee_source=src,
+                            reason=f"algo emri borsada yok: TP/SL çalıştı ({why})", **pnl)
 
         # Borsada algo emri var ama state'te pozisyon yok → state.json silinmiş/eski.
         known = {p.pair for p in self.state.positions}
@@ -1258,6 +1320,27 @@ class Agent:
             print(f"uzlaştırma: {len(self.state.positions)} pozisyon, "
                   f"{len(self.state.pending)} bekleyen emir, {len(algo_by_pair)} algo emri")
 
+    async def _exit_from_fills(self, pos: Position) -> tuple[Decimal | None, Decimal, str]:
+        """TP/SL çalışmış pozisyonun çıkışını dolumlardan çıkar → (fiyat, komisyon, sebep).
+
+        Sebep, çıkış fiyatının `pos.target`'a mı `pos.stop`'a mı yakın olduğuna bakılarak
+        ayrılır; borsa hangi bacağın tetiklendiğini ayrıca söylemiyor. Dolum okunamazsa
+        bugünkü fiyatsız davranışa düşülür ve sebep ayrıştırılmamış `"tp_sl"` kalır.
+        """
+        try:
+            fills = await self.t.get_fills(inst_id=pos.pair, limit=50)
+        except OkxToolError:
+            return None, Decimal(0), "tp_sl"
+        sells = [f for f in fills
+                 if f.get("side") == "sell" and int(f.get("ts") or 0) >= pos.opened_ms]
+        if not sells:
+            return None, Decimal(0), "tp_sl"
+        _, px, fee = fill_totals(pos.pair, sells)
+        if px <= 0:
+            return None, fee, "tp_sl"
+        why = "tp" if abs(px - pos.target) <= abs(px - pos.stop) else "sl"
+        return px, fee, why
+
     async def _rebuild_position(
         self, pair: str, algo_id: str, algos: list[dict[str, Any]]
     ) -> Position | None:
@@ -1268,13 +1351,23 @@ class Agent:
             fills = await self.t.get_fills(inst_id=pair, limit=50)
         except OkxToolError:
             fills = []
-        buys = [f for f in fills if f.get("side") == "buy"]
+        buys = sorted((f for f in fills if f.get("side") == "buy"),
+                      key=lambda f: int(f.get("ts") or 0), reverse=True)
         if not buys and sz <= 0:
             return None
-        total = sum(Decimal(str(f.get("fillSz") or 0)) for f in buys)
-        cost = sum(Decimal(str(f.get("fillSz") or 0)) * Decimal(str(f.get("fillPx") or 0))
-                   for f in buys)
-        entry = (cost / total) if total else Decimal(str(row.get("tpTriggerPx") or 0))
+        if sz > 0:
+            # BU pozisyonun dolumları: en yeniden geriye, algo emrinin miktarı dolana kadar.
+            # Paritedeki tüm alışları toplamak hem giriş fiyatını hem komisyonu şişiriyordu
+            # (Faz 7'de ölçüldü: aynı paritede 4 eski dolum varken fee_paid 0.012 yerine 0.048).
+            taken, acc = [], Decimal(0)
+            for f in buys:
+                if acc >= sz:
+                    break
+                taken.append(f)
+                acc += Decimal(str(f.get("fillSz") or 0))
+            buys = taken
+        total, avg_px, fee = fill_totals(pair, buys)
+        entry = avg_px if total else Decimal(str(row.get("tpTriggerPx") or 0))
         real_sz = sz if sz > 0 else total
         if real_sz <= 0:
             return None
@@ -1283,25 +1376,67 @@ class Agent:
         newest = max((int(f["ts"]) for f in buys), default=now_ms())
         return Position(pair=pair, ord_id=str(row.get("ordId") or ""), cl_ord_id="",
                         entry_px=entry, sz=real_sz, target=tp, stop=sl,
-                        opened_ms=newest, algo_id=algo_id)
+                        opened_ms=newest, algo_id=algo_id, fee_paid=fee)
 
     # ---- çıkışlar ----
 
-    def _close_position(self, pos: Position, exit_px: Decimal | None) -> None:
-        """Pozisyonu state'ten düş, ardışık kayıp ve cooldown'ı güncelle."""
+    def _pnl(self, pos: Position, exit_px: Decimal | None, exit_fee: Decimal) -> dict[str, Any]:
+        """Komisyonlu net PnL. Komisyon = giriş (pos.fee_paid) + çıkış, ikisi de USDT.
+
+        `gross_bps` saf fiyat farkı, `fee_bps` komisyonun giriş notional'ına oranı,
+        `net_bps = gross_bps − fee_bps`. Çıkış fiyatı bilinmiyorsa hepsi None.
+        """
+        fee = pos.fee_paid + exit_fee
+        if exit_px is None or pos.entry_px <= 0:
+            return {"gross_bps": None, "fee_bps": None, "net_bps": None, "net_pnl_usdt": None,
+                    "fee_paid": float(fee)}
+        notional = pos.entry_px * pos.sz
+        gross = (exit_px - pos.entry_px) / pos.entry_px * 10_000
+        fee_bps = (fee / notional * 10_000) if notional else Decimal(0)
+        return {
+            "gross_bps": round(float(gross), 2),
+            "fee_bps": round(float(fee_bps), 2),
+            "net_bps": round(float(gross - fee_bps), 2),
+            "net_pnl_usdt": round(float((exit_px - pos.entry_px) * pos.sz - fee), 6),
+            "fee_paid": float(fee),
+        }
+
+    def _close_position(self, pos: Position, exit_px: Decimal | None, exit_reason: str,
+                        exit_fee: Decimal = Decimal(0),
+                        fee_source: str = "fills") -> dict[str, Any]:
+        """Pozisyonu state'ten düş, kapanan işlemi kaydet, ardışık kayıp ve cooldown'ı güncelle.
+
+        Kayıp ölçüsü Faz 7'den itibaren NET (komisyon sonrası): komisyonu yiyen bir "kazanç"
+        ardışık kayıp sayacını sıfırlamamalı.
+        """
         if pos in self.state.positions:
             self.state.positions.remove(pos)
-        if exit_px is not None and pos.entry_px > 0:
-            pnl_bps = float((exit_px - pos.entry_px) / pos.entry_px * 10_000)
-            if pnl_bps < 0:
+        pnl = self._pnl(pos, exit_px, exit_fee)
+        self.state.closed_positions.append({
+            "ts": datetime.now(tz=self.tz).isoformat(timespec="seconds"),
+            "pair": pos.pair, "entry_px": str(pos.entry_px),
+            "exit_px": None if exit_px is None else str(exit_px),
+            "sz": str(pos.sz), "exit_reason": exit_reason, "fee_source": fee_source,
+            "bars_held": pos.bars_held, **pnl,
+        })
+        cap = self.cfg.execution.closed_positions_max
+        if len(self.state.closed_positions) > cap:
+            del self.state.closed_positions[:-cap]
+
+        if pnl["net_bps"] is not None:
+            if pnl["net_bps"] < 0:
                 self.state.consecutive_losses += 1
                 if self.state.consecutive_losses >= self.cfg.risk.cooldown_losses:
                     self.state.cooldown_until_ms = now_ms() + self.cfg.risk.cooldown_sec * 1000
             else:
                 self.state.consecutive_losses = 0
+        return pnl
 
-    async def close_now(self, pos: Position, reason: str) -> None:
+    async def close_now(self, pos: Position, reason: str, exit_reason: str) -> None:
         """Zaman stopu / flatten / gün sonu: ÖNCE algo iptal, SONRA market sell.
+
+        `exit_reason`: makine okunur çıkış sebebi — "time" | "eod" | "operator"
+        (TP/SL uzlaştırmada tespit edilir, oradan "tp"/"sl" gelir).
 
         Sıra önemli: TP/SL yaşarken market sell atarsak borsa elimizde olmayan miktarı
         satmaya çalışır.
@@ -1341,38 +1476,51 @@ class Agent:
 
         if res.get("dry_run"):
             self.order_log(symbol=pos.pair, request=req, dry_run=True, ok=True)
-            self.decide("EXIT", symbol=pos.pair, reason=f"{reason} (dry-run)", dry_run=True)
-            self._close_position(pos, None)
+            self.decide("EXIT", symbol=pos.pair, reason=f"{reason} (dry-run)", dry_run=True,
+                        exit_reason=exit_reason)
+            self._close_position(pos, None, exit_reason)
             return
 
         ord_id = str(res.get("ordId", ""))
         self.order_log(symbol=pos.pair, request=req, ok=True, response=res, ord_id=ord_id)
-        exit_sz, exit_px = await self._fill_summary(pos.pair, ord_id)
-        px_source = "fills"
+        exit_sz, exit_px, exit_fee = await self._fill_summary(pos.pair, ord_id)
+        px_source = fee_source = "fills"
         if not exit_px:
             # Market satışın dolumu sorguya hemen yansımıyor. Ardışık kayıp/cooldown sayacı
             # fiyatsız çalışmaz, o yüzden son bilinen en iyi alışa düşüyoruz ve kaynağı logluyoruz.
             bid = self.micro_last.get(pos.pair, {}).get("best_bid")
             if bid:
                 exit_px, px_source = Decimal(str(bid)), "best_bid"
+        if exit_fee == 0 and exit_px:
+            # Market satışın dolumu sorguya hemen yansımıyor (yukarıdaki best_bid yolu ile aynı
+            # sebep). Çıkış komisyonunu 0 saymak net PnL'i sistematik olarak İYİMSER gösterir —
+            # gidiş-dönüş komisyonun yarısı kaybolur. Bilinen komisyon oranıyla tahmin edip
+            # satırı `fee_source="estimated"` diye damgalıyoruz; uydurma değil, işaretli tahmin.
+            exit_fee = exit_px * (exit_sz or sz) * Decimal(str(self.fee_bps)) / Decimal(10_000)
+            fee_source = "estimated"
+
+        pnl = self._close_position(pos, exit_px if exit_px else None, exit_reason, exit_fee,
+                                   fee_source)
         self.decide("EXIT", symbol=pos.pair, sz=dstr(exit_sz or sz),
                     price=float(exit_px) if exit_px else None, price_source=px_source,
-                    ord_id=ord_id, reason=reason)
-        print(f"EXIT {pos.pair} {dstr(exit_sz or sz)} @ {dstr(exit_px)} ({px_source}) — {reason}")
-        self._close_position(pos, exit_px if exit_px else None)
+                    fee_source=fee_source, ord_id=ord_id, exit_reason=exit_reason,
+                    reason=reason, **pnl)
+        print(f"EXIT {pos.pair} {dstr(exit_sz or sz)} @ {dstr(exit_px)} ({px_source}) "
+              f"net={pnl['net_bps']}bps ({exit_reason}) — {reason}")
 
     async def check_time_stops(self) -> None:
         limit = self.cfg.signal.time_stop_bars
         for pos in list(self.state.positions):
             if pos.bars_held >= limit:
-                await self.close_now(pos, f"zaman stopu: {pos.bars_held} kapanmış mum ≥ {limit}")
+                await self.close_now(pos, f"zaman stopu: {pos.bars_held} kapanmış mum ≥ {limit}",
+                                     "time")
 
-    async def flatten_all(self, reason: str) -> tuple[int, int]:
+    async def flatten_all(self, reason: str, exit_reason: str) -> tuple[int, int]:
         """Tüm pozisyonları kapat, bekleyenleri iptal et. (kapatılan, iptal edilen) sayısı döner."""
         closed = cancelled = 0
         for pos in list(self.state.positions):
             before = len(self.state.positions)
-            await self.close_now(pos, reason)
+            await self.close_now(pos, reason, exit_reason)
             closed += before - len(self.state.positions)
         for po in list(self.state.pending):
             try:
@@ -1390,6 +1538,7 @@ class Agent:
 
     async def tick(self) -> None:
         self.turn += 1
+        fb_turn_start = self.t.fallback_count
         control = read_control()
         mode = control["mode"]
         orders_allowed = mode == "run"
@@ -1433,7 +1582,7 @@ class Agent:
             # Operatör flatten: yürüt, bayrağı DÜŞÜR, bitişi logla. Bayrak açık kalırsa gün sonuna kadar
             # yeni giriş kilitlenirdi (Faz 5 düzeltmesi). Gün sonu (eod) bayrağı ayrı; o düşürülmez.
             why = "operatör flatten"
-            closed, cancelled = await self.flatten_all(why)
+            closed, cancelled = await self.flatten_all(why, "operator")
             write_control({"flatten": False})
             self._last_flatten = False
             self.decide("OPERATOR_FLATTEN_DONE",
@@ -1441,9 +1590,15 @@ class Agent:
                                f"emir iptal edildi; control.json flatten=false")
             print(f"OPERATÖR FLATTEN bitti: {closed} pozisyon, {cancelled} emir")
         elif eod and (self.state.positions or self.state.pending):
+            # Gün sonu kapanışı OPERATÖR EYLEMİ DEĞİL: ayrı action, ve `control.json`'daki
+            # flatten bayrağına dokunulmaz (operatör dalındaki write_control burada yok).
             why = f"gün sonu {self.cfg.execution.flatten_local}"
             self.decide("CASH", reason=why)
-            await self.flatten_all(why)
+            closed, cancelled = await self.flatten_all(why, "eod")
+            self.decide("EOD_FLATTEN_DONE",
+                        reason=f"gün sonu kapanışı: {closed} pozisyon kapatıldı, {cancelled} "
+                               f"bekleyen emir iptal edildi")
+            print(f"GÜN SONU kapanışı bitti: {closed} pozisyon, {cancelled} emir")
 
         bar_ts = self.signal_due()
         if bar_ts is not None:
@@ -1464,6 +1619,8 @@ class Agent:
         # Kalp atışı decisions.jsonl'e DEĞİL state.json'a (Faz 5): dashboard canlılığı buradan okur.
         self.state.last_turn_ms = now_ms()
         self.state.last_tick_ts = datetime.now(tz=self.tz).isoformat(timespec="seconds")
+        # Tur bazında aktarım: turda bir çağrı bile CLI'ya düştüyse rozet turuncu yanar (Faz 7).
+        self.state.transport = "cli_fallback" if self.t.fallback_count > fb_turn_start else "mcp"
         self.state.save()
 
     async def run(self) -> int:
@@ -1518,7 +1675,9 @@ def main() -> int:
 
     async def go() -> int:
         async with OkxTools(profile=args.profile, demo=args.demo,
-                            expected_demo=args.expected_demo, dry_run=args.dry_run) as t:
+                            expected_demo=args.expected_demo, dry_run=args.dry_run,
+                            cli_fallback=bool(cfg.execution.cli_fallback),
+                            cli_timeout_sec=float(cfg.execution.cli_timeout_sec)) as t:
             return await Agent(cfg, t, args).run()
 
     return asyncio.run(go())

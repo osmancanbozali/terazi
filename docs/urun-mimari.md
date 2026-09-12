@@ -63,6 +63,12 @@ dashboard "AJAN YANIT VERMİYOR" gösterir (state.json 60 sn'den eskiyse).
   **Araç adı tahmin edilmez.**
 - Bir MCP çağrısı 2 kez üst üste hata verirse aynı işlem `okx` CLI'dan (`--json`) denenir ve
   `transport: "cli_fallback"` olarak loglanır. Emir çağrılarında yedek denemesi yoktur (çift emir riski).
+  **Faz 7'de uygulandı, sınırları ölçülmüş hâliyle:** yedek yalnız beş VERİ aracı için var
+  (`market_get_candles|orderbook|trades|ticker`, `account_get_balance` — `tools.CLI_FALLBACK`);
+  emir/algo araçlarının düşmesi `_cli_call`'daki `assert` ile imkânsız. CLI çıktısında
+  `capabilities.demo` yok, yani emir güvenlik kapısı yedekten beslenemez — yedeğin veriyle
+  sınırlı olmasının ikinci sebebi bu. Yedek **oturum içi** düşüşü kapsar (MCP süreci ölürse ajan
+  veri toplamaya devam eder); MCP açılışta hiç kalkmazsa ajan yine başlamaz.
 - Hangi modülün nerede kullanıldığı:
 
 | ATK modülü | Kullanım | Görünürlük |
@@ -98,8 +104,14 @@ her hata         : logla → 30 sn bekle → devam. Ajan asla tamamen durmaz.
  "action":"REJECT","gate":"cost","reason":"hedef 79bps < 2.5×maliyet 45bps",
  "equity":30.1,"daily_pnl_pct":0.0,"open_positions":0,"transport":"mcp"}
 ```
-`action` değerleri: `WAIT | SETUP | CANDIDATE | REJECT | ORDER | FILL | EXIT | CASH | OPERATOR_PAUSE |
-OPERATOR_RESUME | OPERATOR_KILL | OPERATOR_KILL_CLEARED | OPERATOR_FLATTEN | OPERATOR_FLATTEN_DONE | ERROR`.
+`action` değerleri: `WAIT | SETUP | CANDIDATE | REJECT | ORDER | FILL | EXIT | CASH | EOD_FLATTEN_DONE |
+OPERATOR_PAUSE | OPERATOR_RESUME | OPERATOR_KILL | OPERATOR_KILL_CLEARED | OPERATOR_FLATTEN |
+OPERATOR_FLATTEN_DONE | ERROR`.
+`EXIT` satırı (Faz 7) komisyonlu sonucu taşır: `exit_reason` (`tp|sl|tp_sl|time|eod|operator`),
+`gross_bps`, `fee_bps`, `net_bps`, `net_pnl_usdt`, `fee_paid`. Aynı kayıt `state.json`'daki
+`closed_positions` listesine de düşer; dashboard "Kapanan işlemler" kartı oradan okur.
+`EOD_FLATTEN_DONE` gün sonu kapanışının bittiğini bildirir — **operatör eylemi değildir**, bu yüzden
+`OPERATOR_*` kovasına girmez ve `control.json`'daki `flatten` bayrağına dokunmaz.
 Yargıç kararı ayrı satır açmaz: adayın yargıçtan SONRAKİ satırı (risk `REJECT`, `ORDER`, `ERROR`; VETO'da
 `REJECT gate=judge`) `llm: {decision, size_multiplier, news_risk, status, model, reason}` alanını taşır.
 

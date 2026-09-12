@@ -68,10 +68,10 @@
 
       <div class="shrink-0 h-[108px] flex flex-col rounded-lg bg-slate-900/60 border border-slate-800">
         <div class="shrink-0 flex items-baseline justify-between px-3 py-1.5 border-b border-slate-800">
-          <h2 class="font-semibold text-slate-300">Son emirler</h2>
+          <h2 class="font-semibold text-slate-300">Kapanan işlemler</h2>
           <span id="ord-meta" class="text-[11px] text-slate-500"></span>
         </div>
-        <div id="orders" class="flex-1 min-h-0 overflow-y-auto p-2 space-y-1"></div>
+        <div id="closed" class="flex-1 min-h-0 overflow-y-auto p-2 space-y-1"></div>
       </div>
 
       <!-- AJANA SOR -->
@@ -151,6 +151,16 @@ const ACTION_STYLE = {
   EXIT:      "bg-yellow-950 text-yellow-300 border-yellow-800",
   CASH:      "bg-yellow-950 text-yellow-300 border-yellow-800",
   ERROR:     "bg-red-950 text-red-300 border-red-700",
+  EOD_FLATTEN_DONE: "bg-yellow-900 text-yellow-200 border-yellow-700",
+};
+// Kapanan işlemin çıkış sebebi: tp yeşil · sl kırmızı · diğerleri nötr
+const EXIT_STYLE = {
+  tp:       "bg-green-950 text-green-300 border-green-800",
+  sl:       "bg-red-950 text-red-300 border-red-700",
+  tp_sl:    "bg-slate-800 text-slate-400 border-slate-700",
+  time:     "bg-blue-950 text-blue-300 border-blue-800",
+  eod:      "bg-yellow-950 text-yellow-300 border-yellow-800",
+  operator: "bg-slate-100 text-slate-900 border-slate-300",
 };
 const OPERATOR_STYLE = "bg-slate-100 text-slate-900 border-slate-300";
 const styleFor = a => (a || "").startsWith("OPERATOR_") ? OPERATOR_STYLE
@@ -241,6 +251,14 @@ function renderCards(s) {
                   "bg-red-950 border-red-700 text-red-300",
                   `state.json ${s.state_age_sec ?? "?"} sn önce yazıldı (eşik ${s.stale_sec} sn)`));
   }
+
+  // aktarım: mcp yeşil · cli_fallback turuncu (urun-mimari.md §4 üst şerit)
+  const tr = st.transport || "mcp";
+  out.push(card("aktarım", esc(tr),
+                tr === "mcp" ? "bg-green-950/40 border-green-900 text-green-300"
+                             : "bg-orange-950/70 border-orange-800 text-orange-300",
+                tr === "mcp" ? "MCP oturumu sağlam"
+                             : "MCP düştü, veri çağrıları okx CLI yedeğinden geliyor"));
 
   out.push(card("bugün", `${c.total || 0} karar · ${c.WAIT || 0} bekle · ${c.REJECT || 0} red · ${c.ORDER || 0} emir`,
                 "bg-slate-900/60 border-slate-800",
@@ -350,21 +368,29 @@ function renderPositions(s) {
   $("positions").innerHTML = `<table class="w-full text-[12px]">${head}${body}${pending}</table>`;
 }
 
-function renderOrders(data) {
-  const rows = (data.rows || []).slice(0, 5);
-  $("ord-meta").textContent = data.count ? `toplam ${data.count}` : "";
+// Kapanan işlemler: kaynak state.json (ajan yazar), en yeni SONDA geldiği için ters çevrilir.
+// Net = komisyon sonrası; brüt/komisyon ayrıntısı title'da.
+function renderClosed(s) {
+  const all = (s.state || {}).closed_positions || [];
+  const rows = all.slice().reverse().slice(0, 5);
+  $("ord-meta").textContent = all.length ? `toplam ${all.length}` : "";
   if (!rows.length) {
-    $("orders").innerHTML = `<div class="h-full flex items-center justify-center text-slate-600">emir yok</div>`;
+    $("closed").innerHTML = `<div class="h-full flex items-center justify-center text-slate-600">henüz kapanan işlem yok</div>`;
     return;
   }
-  $("orders").innerHTML = rows.map(o => {
-    const cls = o.ok ? "bg-green-950 text-green-300 border-green-800" : "bg-red-950 text-red-300 border-red-800";
-    const tag = o.ok ? (o.dry_run ? "dry-run" : "ok") : (o.s_code || "hata");
-    return `<div class="flex items-baseline gap-2 px-1.5 py-1 rounded bg-slate-900/40 border border-slate-800" title="${esc(o.s_msg)}">
-        <span class="font-mono text-[11px] text-slate-500 shrink-0">${esc(hhmm(o.ts))}</span>
-        <span class="font-mono text-[11px] text-slate-300 shrink-0">${esc(o.symbol || "—")}</span>
-        <span class="text-[11px] text-slate-400 shrink-0">${esc(o.action)}</span>
-        <span class="ml-auto shrink-0 px-1.5 py-0.5 rounded border text-[10px] font-bold ${cls}">${esc(tag)}</span>
+  $("closed").innerHTML = rows.map(c => {
+    const net = c.net_bps, pnl = c.net_pnl_usdt;
+    const netCls = net == null ? "text-slate-500" : net > 0 ? "text-green-300" : net < 0 ? "text-red-300" : "text-slate-300";
+    const why = c.exit_reason || "—";
+    const wcls = EXIT_STYLE[why] || "bg-slate-800 text-slate-400 border-slate-700";
+    const tip = `giriş ${c.entry_px} → çıkış ${c.exit_px ?? "—"} · sz ${c.sz}` +
+                (c.gross_bps == null ? "" : ` · brüt ${c.gross_bps}bps − komisyon ${c.fee_bps}bps`);
+    return `<div class="flex items-baseline gap-2 px-1.5 py-1 rounded bg-slate-900/40 border border-slate-800" title="${esc(tip)}">
+        <span class="font-mono text-[11px] text-slate-500 shrink-0">${esc(hhmm(c.ts))}</span>
+        <span class="font-mono text-[11px] text-slate-300 shrink-0">${esc(c.pair || "—")}</span>
+        <span class="font-mono text-[11px] font-semibold shrink-0 ${netCls}">${net == null ? "—" : (net > 0 ? "+" : "") + net + " bps"}</span>
+        <span class="font-mono text-[10px] text-slate-500 shrink-0">${pnl == null ? "" : (pnl > 0 ? "+" : "") + pnl + " USDT"}</span>
+        <span class="ml-auto shrink-0 px-1.5 py-0.5 rounded border text-[10px] font-bold ${wcls}">${esc(why)}</span>
       </div>`;
   }).join("");
 }
@@ -662,15 +688,16 @@ async function tick() {
   const sig = inflight.signal;
   const get = u => fetch(u, { signal: sig }).then(r => r.json());
   try {
-    const [s, feed, orders, llm, equity, micro] = await Promise.all([
-      get("/state"), get("/feed?n=50"), get("/orders"),
+    // /orders artık çekilmiyor: "Kapanan işlemler" kartı state.json'dan besleniyor (Faz 7).
+    const [s, feed, llm, equity, micro] = await Promise.all([
+      get("/state"), get("/feed?n=50"),
       get("/llm?n=5"), get("/equity"), get("/micro?minutes=30"),
     ]);
     inflight = null;
     $("conn").classList.add("hidden");
     if (s.poll_sec) pollMs = s.poll_sec * 1000;
     renderCards(s); renderRegimeLlm(s); renderControl(s); renderPositions(s);
-    renderFeed(feed); renderOrders(orders); renderLlm(llm);
+    renderFeed(feed); renderClosed(s); renderLlm(llm);
     renderEquity(equity); renderMicro(micro);
   } catch (err) {
     if (err.name === "AbortError") return;
