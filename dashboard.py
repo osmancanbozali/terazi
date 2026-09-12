@@ -4,7 +4,8 @@ Ayrı süreç. Kaynak YALNIZCA dosyalar: logs/decisions.jsonl, logs/orders.jsonl
 state.json, control.json. Burada MCP çağrısı YOK, borsaya temas YOK — ajan çökse bile dashboard
 ayakta kalır, dashboard çökse bile ajan durmaz (docs/urun-mimari.md §3.1).
 
-Yazdığı tek dosya `control.json` (atomik) ve `logs/decisions.jsonl`'e eklediği OPERATOR_* satırı.
+Yazdığı TEK dosya `control.json` (atomik). `decisions.jsonl`'e YAZMAZ: operatör eylemlerinin tek
+kaynağı ajandır — ajan control.json'daki değişimi görünce OPERATOR_* satırını kendisi düşer (Faz 5).
 Al/sat düğmesi yoktur (CLAUDE.md mutlak yasak); kontrol yüzeyi run/pause/kill/flatten ile sınırlı.
 
 Başlatma:
@@ -57,9 +58,8 @@ ACTIONS = ("WAIT", "SETUP", "CANDIDATE", "REJECT", "ORDER", "FILL", "EXIT", "CAS
 def load_cfg() -> dict[str, Any]:
     """config.yaml SALT OKUNUR. Dashboard buradan yalnızca okur, asla yazmaz.
 
-    `dashboard:` bloğu config.yaml'da henüz yok; eklenene kadar spec değerlerine düşülür
-    (docs/urun-mimari.md §4: 2 sn polling, 60 sn bayatlık). Blok eklenirse kod değişmeden
-    oradan okunur.
+    `dashboard:` bloğu: `poll_ms` (yenileme) ve `alive_threshold_s` (bayatlık). Blok yoksa spec
+    değerlerine düşülür (docs/urun-mimari.md §4: 2 sn polling, 60 sn bayatlık).
     """
     try:
         cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}
@@ -69,10 +69,9 @@ def load_cfg() -> dict[str, Any]:
     dash = cfg.get("dashboard") or {}
     return {
         "tz": ZoneInfo((cfg.get("execution") or {}).get("timezone", "Europe/Istanbul")),
-        "vol_ban_sec": (cfg.get("regime") or {}).get("vol_ban_sec", 1800),
         "kill_switch_daily_pct": (cfg.get("risk") or {}).get("kill_switch_daily_pct", -1.5),
-        "poll_sec": dash.get("poll_sec", 2),
-        "stale_sec": dash.get("stale_sec", 60),
+        "poll_sec": float(dash.get("poll_ms", 2000)) / 1000.0,
+        "stale_sec": float(dash.get("alive_threshold_s", 60)),
     }
 
 
@@ -152,12 +151,6 @@ def write_control(patch: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def append_decision(row: dict[str, Any]) -> None:
-    LOGS.mkdir(exist_ok=True)
-    with DECISIONS.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -192,14 +185,10 @@ def count_today(rows: list[dict[str, Any]], today: str) -> dict[str, int]:
     return counts
 
 
-def derive_regime(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Rejim rozeti. `state.json` rejimi taşımıyor, karar akışından okunur.
-
-    Vol kesici (giriş yasağı) için de tek kaynak akış: ajan yasağı `gate="volatility"` satırıyla
-    logluyor ama `vol_ban_until_ms`'i state'e yazmıyor. Yasağın bitişi bu yüzden o satırın
-    zamanı + config.regime.vol_ban_sec olarak hesaplanır — SINIR: ajan yeniden başlarsa
-    yasak bellekte sıfırlanır, burada süre dolana kadar sarı görünmeye devam eder.
-    """
+def derive_regime(rows: list[dict[str, Any]], state: dict[str, Any]) -> dict[str, Any]:
+    """Rejim rozeti. Seviye karar akışından (son satırın `regime` alanı); giriş yasağı
+    `state.vol_ban_until_ms`'ten (Faz 5: ajan yazıyor, akıştan süre hesabı kalktı). Gerekçe
+    metni son `gate="volatility"` satırından."""
     level = "MEAN_REVERSION"
     for r in reversed(rows):
         if r.get("regime"):
@@ -208,12 +197,15 @@ def derive_regime(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     ban = False
     reason = ""
-    for r in reversed(rows):
-        if r.get("gate") == "volatility":
-            left = CFG["vol_ban_sec"] - (age_sec(r.get("ts")) or CFG["vol_ban_sec"])
-            if left > 0:
-                ban, reason = True, f"{r.get('reason', 'vol kesici')} ({int(left // 60)} dk kaldı)"
-            break
+    until = int(state.get("vol_ban_until_ms") or 0)
+    left_ms = until - now_ms()
+    if left_ms > 0:
+        ban = True
+        reason = f"vol kesici ({left_ms // 60000} dk kaldı)"
+        for r in reversed(rows):
+            if r.get("gate") == "volatility":
+                reason = f"{r.get('reason', 'vol kesici')} ({left_ms // 60000} dk kaldı)"
+                break
 
     if level == "CASH":
         for r in reversed(rows):
@@ -305,7 +297,8 @@ def get_state() -> dict[str, Any]:
         "poll_sec": CFG["poll_sec"],
         "last_decision_ts": last.get("ts") if last else None,
         "last_decision_age_sec": round(age_sec(last.get("ts")) or 0, 0) if last else None,
-        "regime": derive_regime(rows),
+        "regime": derive_regime(rows, state),
+        "regime_commentary": state.get("regime_commentary"),
         "kill_switch": derive_kill(state, control),
         "cooldown": {
             "active": cooldown_left > 0,
@@ -344,8 +337,8 @@ class ControlBody(BaseModel):
 def post_control(body: ControlBody) -> dict[str, Any]:
     """Operatör yüzeyi: run / pause / kill / flatten. AL-SAT YOK.
 
-    Her eylem `decisions.jsonl`'e OPERATOR_* satırı olarak düşer (§2 "görünmez müdahale yok").
-    Ajan mode değişimini kendi satırıyla ayrıca loglar: dashboard satırı KOMUT, ajan satırı ONAY.
+    Yalnızca `control.json` yazılır. OPERATOR_* satırını `decisions.jsonl`'e AJAN düşer (tek kaynak);
+    dashboard log yazmaz — görünmez müdahale yok, çift satır da yok.
     """
     if body.mode is None and body.flatten is None:
         raise HTTPException(status_code=400, detail="Gövdede mode veya flatten olmalı.")
@@ -356,14 +349,12 @@ def post_control(body: ControlBody) -> dict[str, Any]:
         if not body.flatten:
             raise HTTPException(status_code=400, detail="flatten yalnızca true olarak gönderilir.")
         action, patch = "OPERATOR_FLATTEN", {"flatten": True}
-        reason = "dashboard: tüm açık pozisyonlar kapatılsın"
         needs_confirm = True
     else:
         mode = body.mode
         if mode not in MODES:
             raise HTTPException(status_code=400, detail=f"Geçersiz mode '{mode}'. Geçerli: {', '.join(MODES)}.")
         action, patch = f"OPERATOR_{mode.upper()}", {"mode": mode}
-        reason = f"dashboard: control.json mode={mode}"
         needs_confirm = mode in CONFIRM_REQUIRED
 
     if needs_confirm and not body.confirm:
@@ -373,20 +364,6 @@ def post_control(body: ControlBody) -> dict[str, Any]:
                    "control.json'a hiçbir şey yazılmadı.",
         )
 
-    # Karar satırı akıştaki diğer satırlarla aynı şekli taşısın diye state'ten doldurulur.
-    state = read_json(STATE)
-    rows, _ = read_jsonl_tail(DECISIONS, 1)
-    append_decision({
-        "ts": datetime.now(tz=CFG["tz"]).isoformat(timespec="seconds"),
-        "action": action,
-        "equity": state.get("equity", "0"),
-        "daily_pnl_pct": state.get("daily_pnl_pct", 0.0),
-        "open_positions": len(state.get("positions", [])),
-        "regime": (rows[0].get("regime") if rows else None) or "MEAN_REVERSION",
-        "transport": state.get("transport", "mcp"),
-        "source": "dashboard",
-        "reason": reason,
-    })
     control = write_control(patch)
     return {"ok": True, "action": action, "control": control}
 

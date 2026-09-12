@@ -115,8 +115,10 @@ Bant daraldığında bu kapı çoğu adayı eler. İstenen davranıştır.
 
 ### 4.5 LLM yargıç — "Bu düşüş sıradan mı, haber mi?"
 
-Yalnızca aday oluştuğunda çağrılır. Girdi: aday özeti, son 10 mum özeti, ATK `news` çıktısı,
-funding/OI. Çıktı yapılandırılmış: `decision: APPROVE|REDUCE|VETO`, `size_multiplier: 0,3–1,0`,
+Yalnızca **mikro teyidi ve maliyet kapısını geçen** aday için çağrılır (maliyet kapısı adayların
+çoğunu eler; elenen aday için LLM ve haber aracı çağrılmaz). Girdi: aday özeti, son 10 mum özeti,
+ATK `news` çıktısı (haber + duygu), funding. Haber aracı düşerse alan "veri yok" olur, LLM yine çağrılır;
+fail-open yalnızca LLM'in kendisi düşünce. Çıktı yapılandırılmış: `decision: APPROVE|REDUCE|VETO`, `size_multiplier: 0,3–1,0`,
 `reason ≤ 300`, `news_risk: none|low|high`.
 
 **LLM frene basabilir, gaza basamaz.** Emin değilse VETO. Zaman aşımında (20 sn) aday geçirilir ve

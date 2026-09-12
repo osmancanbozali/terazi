@@ -468,3 +468,23 @@ Pratik sonuç `tools.py` için:
   geçmiyorsa işlemi reddet — sessizce minSz'a yükseltme.
 - Fiyatı `tickSz`'a yuvarla: BTC 0.1, ETH 0.01, SOL 0.01.
 - Tüm sayılar API'ye **string** gider; `Decimal` ile hesapla, `str()` ile gönder.
+
+## 9. news / smartmoney / funding — gerçek zarflar (Faz 5, 12 Eylül)
+
+Hepsi standart üç kat zarf (`payload.data.data`), `tools._call` olduğu gibi soyar. Alanlar **string**.
+
+| araç | `data.data` şekli |
+|---|---|
+| `news_get_by_coin {"coins":"BTC","importance":"high","limit":2,"detailLvl":"brief"}` | `[{"details":[{id, title, importance, ccyList, ccySentiments:[{ccy,sentiment}], cTime, sourceUrl, platformList, summary:"", content:""}]}]` — brief'te `summary`/`content` **boş**; başlık + duygu kullanılır |
+| `news_get_coin_sentiment {"coins":"BTC","period":"1h"}` | `[{"details":[{ccy, mentionCnt, newsMentionCnt, xMentionCnt, sentiment:{label, bullishCnt, bullishRatio, bearishCnt, bearishRatio, neutralCnt}, trend:[]}], period, ts}]` |
+| `news_get_sentiment_ranking {"period":"4h","limit":3}` | aynı öğe şekli, `details` çok ccy |
+| `market_get_funding_rate {"instId":"BTC-USDT-SWAP"}` | `[{fundingRate, nextFundingRate, premium, fundingTime, nextFundingTime, settFundingRate, settState, minFundingRate, maxFundingRate, ...}]` |
+| `smartmoney_get_signal_overview_by_filter {"instCcyList":["BTC","ETH","SOL"],"sortBy":"pnl","period":"7"}` | `[{ccy, dataVersion, longShortRatio:{longRatio, shortRatio, longRatioVs1h, longRatioVs24h, longRatioVs7d, weightedLongRatio, weightedShortRatio}, longTraders, shortTraders, notional:{longNotionalUsdt, shortNotionalUsdt, netNotionalUsdt, totalNotionalUsdt, smartMoneyLongAvgEntry, ...}, winRate:{avgLongWinRate, avgShortWinRate}, tradersQualified, tradersWithPosition}]` |
+
+**TUZAK — `mcp` 2.2 istemcisi smartmoney'de sahte hata atıyor.** `ClientSession.call_tool` sonucu aracın
+`output_schema`'sına göre doğruluyor; `smartmoney_get_signal_overview_by_filter` için
+`RuntimeError: Invalid structured content ... 'endpoint' is a required property` geliyor. Ham
+`content[0].text` sağlam ve standart zarf. `tools.LenientSession` doğrulamayı kapatır (biz
+`structured_content` kullanmıyoruz). Diğer dört araçta doğrulama zaten geçiyordu.
+
+`news_*` `limit` tavanı ölçülmedi; `tools.py` 20 ile sınırlar, LLM girdisi 5 kullanır.

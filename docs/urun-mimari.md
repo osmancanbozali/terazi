@@ -80,12 +80,16 @@ dashboard "AJAN YANIT VERMİYOR" gösterir (state.json 60 sn'den eskiyse).
 ```
 her 20 sn        : control.json oku → 3 parite orderbook+trades → micro.jsonl
 15m kapanış+15 sn: candles → indikatörler → rejim (30 dk'da bir) → sinyal
-                   aday varsa: yargıç → mikro teyit → maliyet kapısı → risk kapısı → emir
-her 30 dk        : rejim yorumcusu (LLM) → llm.jsonl
+                   aday varsa: mikro teyit → maliyet kapısı → yargıç (LLM) → risk kapısı → emir
+her 30 dk        : rejim yorumcusu (LLM, rejim hesabıyla aynı anda) → llm.jsonl + state.json
 her 60 sn        : açık emirler + bakiye ile uzlaş → zaman/gün sonu kontrolleri → state.json
-her tur          : decisions.jsonl'e bir satır (WAIT dahil, gerekçeli)
+her tur          : state.json'a last_tick_ts (kalp atışı) — decisions.jsonl'e 20 sn'lik satır DÜŞMEZ
+15m geçişi       : parite başına en az bir satır (olay yoksa sayısal gerekçeli WAIT: "RSI 57.2 > 36")
 her hata         : logla → 30 sn bekle → devam. Ajan asla tamamen durmaz.
 ```
+
+> Faz 5 kararı: yargıç maliyet kapısından SONRA çağrılır — maliyet adayların çoğunu eler, elenen aday
+> için LLM ve haber aracı çağrılmaz. Fren rolü değişmez (strateji.md §4.5).
 
 `decisions.jsonl` satır şeması (örnek):
 ```json
@@ -95,14 +99,18 @@ her hata         : logla → 30 sn bekle → devam. Ajan asla tamamen durmaz.
  "equity":30.1,"daily_pnl_pct":0.0,"open_positions":0,"transport":"mcp"}
 ```
 `action` değerleri: `WAIT | SETUP | CANDIDATE | REJECT | ORDER | FILL | EXIT | CASH | OPERATOR_PAUSE |
-OPERATOR_RESUME | OPERATOR_KILL | OPERATOR_KILL_CLEARED | OPERATOR_FLATTEN | ERROR`.
+OPERATOR_RESUME | OPERATOR_KILL | OPERATOR_KILL_CLEARED | OPERATOR_FLATTEN | OPERATOR_FLATTEN_DONE | ERROR`.
+Yargıç kararı ayrı satır açmaz: adayın yargıçtan SONRAKİ satırı (risk `REJECT`, `ORDER`, `ERROR`; VETO'da
+`REJECT gate=judge`) `llm: {decision, size_multiplier, news_risk, status, model, reason}` alanını taşır.
 
 > Uygulama notu: ajan mode değişimini `OPERATOR_{mode.upper()}` ile yazdığı için pratikte
 > `OPERATOR_RUN` görülür, `OPERATOR_RESUME` değil. `OPERATOR_KILL_CLEARED`, açılışta
 > `control.json`'da kalan `mode=kill`'in bir kerelik tüketildiğini bildirir (Faz 4 hotfix).
 > Dashboard hepsini tek `OPERATOR_*` kovasında sayar.
-> Dashboard'un yazdığı satırlarda `"source": "dashboard"` alanı bulunur: dashboard satırı
-> **komut**, ajanın kendi satırı **onay**dır; ikisi de loglanır.
+> Operatör satırlarının **tek yazarı ajandır** (Faz 5): dashboard yalnızca `control.json` yazar,
+> ajan değişimi görünce `OPERATOR_*` satırını düşer. `OPERATOR_FLATTEN_DONE`: flatten yürütüldü ve
+> ajan `control.json`'daki `flatten` bayrağını kendisi `false` yaptı (bayrak açık kalıp yeni girişleri
+> kilitlemesin). Faz 4'teki `"source": "dashboard"` satırları artık üretilmez.
 
 ### 3.4 LLM katmanı (`judge.py`)
 

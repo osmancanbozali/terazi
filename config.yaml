@@ -73,8 +73,32 @@ profiles:
     expected_demo: true
 
 llm:
-  enabled: false               # Faz 5; bu fazda judge pass-through
-  timeout_sec: 20
+  enabled: true                # Faz 5: yargıç + rejim yorumcusu (judge.py). false → pass-through
+  timeout_sec: 20              # istek başına; SDK yeniden denemesi kapalı, bütçe gerçek
+  primary_model: claude-sonnet-5
+  fallback_model: claude-haiku-4-5-20251001
+  effort: low                  # yalnızca birincil modele gönderilir (Haiku effort kabul etmiyor)
+  max_tokens: 2048
+  reason_max_chars: 300
+  input_summary_max_chars: 500
+  size_multiplier_min: 0.3     # REDUCE alt sınırı; APPROVE her zaman 1.0
+  judge:
+    recent_bars: 10            # yargıca verilen son kapanmış mum sayısı
+    news_limit: 5
+    news_importance: high
+    news_detail: brief
+    sentiment_period: 1h
+  regime:
+    h1_bars: 24                # yorumcuya verilen BTC 1H mum sayısı
+    smartmoney_ccys: [BTC, ETH, SOL]
+    smartmoney_sort: pnl
+    smartmoney_period: "7"
+    ranking_period: 4h
+    ranking_limit: 5
+
+dashboard:
+  poll_ms: 2000                # index.html yenileme aralığı
+  alive_threshold_s: 60        # state.json bundan eskiyse "AJAN YANIT VERMİYOR"
 
 # SADECE DEMO TEST BLOĞU.
 # enabled: true iken capabilities.demo is not True ise ajan BAŞLAMAYI REDDEDER — canlıda

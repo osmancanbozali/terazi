@@ -4,8 +4,13 @@ Karar mantığı `calibrate.py`'den IMPORT edilir (`SetupTracker`, `Bar`, `add_i
 canlı ile backtest'in sapması imkânsız olsun diye. Sayısal hiçbir eşik burada değil; hepsi
 `config.yaml`'da (CLAUDE.md kuralı).
 
-Emre giden tek yol: sinyal → judge → mikro teyit → maliyet kapısı → risk kapısı → emir.
-Bu sırayı atlayan kod yok; `_try_enter` dışında `tools.place_order` çağrılmaz.
+Emre giden tek yol: sinyal → mikro teyit → maliyet kapısı → LLM yargıç (judge.py) → risk kapısı → emir.
+Bu sırayı atlayan kod yok; `_place_entry` / `close_now` dışında `tools.place_order` çağrılmaz.
+Yargıç maliyet kapısından SONRA: maliyet adayların çoğunu eler, elenen aday için LLM çağrılmaz (Faz 5).
+
+Kayıt disiplini (Faz 5): decisions.jsonl'e 20 sn'lik kalp atışı GİRMEZ (state.json last_tick_ts);
+yalnızca 15m değerlendirmeleri (parite başına sayısal gerekçeli WAIT), SETUP/CANDIDATE/REJECT/ORDER/
+FILL/EXIT/ERROR, rejim değişimi, operatör eylemleri (tek kaynak: ajan) ve LLM verdict özeti.
 
 Çalıştırma:
     .venv/bin/python terazi.py --profile hackathon --dry-run --max-turns 3
@@ -17,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import sys
 import traceback
@@ -33,6 +39,7 @@ import pandas as pd
 import yaml
 
 from calibrate import Bar, Ev, SetupTracker, add_indicators
+from judge import Judge, Verdict
 from tools import BAR_MS, OkxTools, OkxToolError, SafetyGateError
 
 LOGS = Path("logs")
@@ -98,6 +105,13 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
 def parse_hhmm(text: str) -> dtime:
     hh, mm = text.split(":")
     return dtime(int(hh), int(mm))
+
+
+def fmt_px(value: float) -> str:
+    """Fiyatı Türkçe okunur yaz: 76.000–79.900 (binlik nokta, ≥1000'de ondalıksız); küçükte 4 anlamlı."""
+    if abs(value) >= 1000:
+        return f"{value:,.0f}".replace(",", ".")
+    return f"{value:.4g}"
 
 
 # ----------------------------------------------------------------------------
@@ -224,28 +238,6 @@ class Regime:
         return True, ""
 
 
-@dataclass
-class Verdict:
-    """LLM yargıcı çıktısı (strateji.md §4.5). Faz 5'te gerçek çağrı bağlanacak."""
-
-    decision: Literal["APPROVE", "REDUCE", "VETO"] = "APPROVE"
-    size_multiplier: float = 1.0
-    reason: str = "judge kapalı (Faz 5)"
-    news_risk: Literal["none", "low", "high"] = "none"
-    status: str = "disabled"
-
-
-async def judge(candidate: dict[str, Any], cfg: Cfg, tools: OkxTools) -> Verdict:
-    """LLM yargıç. Faz 2'de KAPALI: imza sabit, pass-through döner.
-
-    Faz 5: aday özeti + son 10 mum + news + funding/OI → APPROVE/REDUCE/VETO.
-    LLM sadece FREN — asla gaz. Zaman aşımında aday geçirilir (fail-open).
-    """
-    if not cfg.llm.enabled:
-        return Verdict()
-    raise NotImplementedError("judge Faz 5'te bağlanacak")
-
-
 def cost_gate(target_bps: float, fee_bps: float, spread: float, mult: float) -> tuple[bool, str]:
     cost = 2 * fee_bps + spread
     need = mult * cost
@@ -333,9 +325,12 @@ class State:
     daily_trades: int = 0
     kill_switch: bool = False
     last_turn_ms: int = 0
+    last_tick_ts: str = ""  # kalp atışı (Faz 5): decisions.jsonl yerine burada
     last_signal_bar_ts: int = 0
     trade_day: str = ""
     transport: str = TRANSPORT
+    vol_ban_until_ms: int = 0  # dashboard sarı rozeti buradan okur (Faz 5)
+    regime_commentary: dict[str, Any] | None = None  # LLM rejim yorumu (30 dk)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -351,9 +346,12 @@ class State:
             "daily_trades": self.daily_trades,
             "kill_switch": self.kill_switch,
             "last_turn_ms": self.last_turn_ms,
+            "last_tick_ts": self.last_tick_ts,
             "last_signal_bar_ts": self.last_signal_bar_ts,
             "trade_day": self.trade_day,
             "transport": self.transport,
+            "vol_ban_until_ms": self.vol_ban_until_ms,
+            "regime_commentary": self.regime_commentary,
         }
 
     @classmethod
@@ -375,6 +373,8 @@ class State:
             last_turn_ms=d.get("last_turn_ms", 0),
             last_signal_bar_ts=d.get("last_signal_bar_ts", 0),
             trade_day=d.get("trade_day", ""),
+            vol_ban_until_ms=int(d.get("vol_ban_until_ms") or 0),
+            regime_commentary=d.get("regime_commentary"),
         )
         dse = d.get("day_start_equity")
         st.day_start_equity = Decimal(dse) if dse else None
@@ -442,6 +442,21 @@ def read_control() -> dict[str, Any]:
     return {"mode": data.get("mode", "run"), "flatten": bool(data.get("flatten", False))}
 
 
+def write_control(patch: dict[str, Any]) -> dict[str, Any]:
+    """control.json'u BİRLEŞTİREREK ve ATOMİK yaz (dashboard ile aynı disiplin: geçici dosya + os.replace).
+
+    Ajan yalnızca iki durumda yazar: açılışta mode=kill'i tüketirken ve flatten yürütüldükten sonra
+    bayrağı düşürürken. Operatör komutu vermez; verilen komutu tüketir.
+    """
+    cur = read_control()
+    merged = {"mode": cur["mode"], "flatten": cur["flatten"]}
+    merged.update(patch)
+    tmp = CONTROL.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, CONTROL)
+    return merged
+
+
 # ----------------------------------------------------------------------------
 # Ajan
 # ----------------------------------------------------------------------------
@@ -464,6 +479,10 @@ class Agent:
         self.fee_bps: float = 0.0
         self.last_reconcile_ms = 0
         self.turn = 0
+        self.judge = Judge(cfg, tools)  # LLM katmanı; llm.enabled=false ise pass-through
+        self._h1_bars: list[dict[str, Any]] = []  # rejim yorumcusu için son 1H mumlar
+        self._last_mode = "run"
+        self._last_flatten = False
 
     # ---- kayıt yardımcıları ----
 
@@ -513,6 +532,9 @@ class Agent:
         self.state = State.load()
         self.state.profile = self.t.profile
         self.state.demo = caps_demo
+        # Vol kesici yasağı süreç ömrünü aşar: state'te duruyorsa yeniden başlatma onu SIFIRLAMAZ
+        # (Faz 4'te dashboard bunu akıştan tahmin etmek zorundaydı; artık tek kaynak state).
+        self.regime.vol_ban_until_ms = self.state.vol_ban_until_ms
         if archived:
             print(f"PROFİL DEĞİŞTİ: {archived['old_profile']} (demo={archived['old_demo']}) → "
                   f"{self.t.profile} (demo={caps_demo})")
@@ -567,16 +589,18 @@ class Agent:
         # kalan mode=kill bir kerelik tüketilir, yoksa ajan her açılışta ilk turda kendini öldürür.
         ctl = read_control()
         if ctl["mode"] == "kill":
-            CONTROL.write_text(
-                json.dumps({"mode": "run", "flatten": ctl["flatten"]}, indent=2), encoding="utf-8"
-            )
+            write_control({"mode": "run"})
             self.decide("OPERATOR_KILL_CLEARED",
                         reason="control.json'da mode=kill bulundu; bir kerelik tüketildi → run. "
                                "Acil Durdur döngüyü durdurur, yeniden başlatmayı engellemez.")
             print("control.json mode=kill tüketildi → run")
+        self._last_flatten = read_control()["flatten"]
 
         # Borsa kaynak gerçek: state.json ne derse desin önce uzlaştır.
         await self.reconcile(startup=True)
+
+        # Rejim açılışta hesaplanır (ilk 15m'e kadar "başlangıç" kalmasın); yorumcu da burada ilk kez çalışır.
+        await self.refresh_regime(force=True)
 
     async def _validate_universe(self) -> None:
         """Evren doğrulaması: hacim + enstrüman kısıtları + boyutun minSz'ı geçmesi.
@@ -723,16 +747,23 @@ class Agent:
             return
         low = float(min(c.l for c in closed))
         high = float(max(c.h for c in closed))
+        # Rejim yorumcusu girdisi: son N adet 1H mum (config llm.regime.h1_bars)
+        self._h1_bars = [
+            {"t": datetime.fromtimestamp(c.ts / 1000, tz=self.tz).strftime("%m-%d %H:%M"),
+             "o": str(c.o), "h": str(c.h), "l": str(c.l), "c": str(c.c)}
+            for c in closed[-int(self.cfg.llm.regime.h1_bars):]
+        ]
 
         m15 = await self.load_frame(pair, self.cfg.signal.bar,
                                    self.cfg.signal.bb_period + self.cfg.signal.warmup_bars)
         last = m15.iloc[-1]
         level: Literal["MEAN_REVERSION", "CASH"] = "MEAN_REVERSION"
-        reason = f"aralık {low:.4g}–{high:.4g} korunuyor"
+        reason = f"aralık {fmt_px(low)}–{fmt_px(high)} korunuyor"
         if float(last.close) < low * self.cfg.regime.break_low_mult:
-            level, reason = "CASH", f"taban kırıldı: {last.close:.4g} < {low * self.cfg.regime.break_low_mult:.4g}"
+            level, reason = "CASH", (f"taban kırıldı: {fmt_px(float(last.close))} < "
+                                     f"{fmt_px(low * self.cfg.regime.break_low_mult)}")
         elif float(last.close) > high:
-            level, reason = "CASH", f"yukarı kırılım: {last.close:.4g} > {high:.4g}"
+            level, reason = "CASH", f"yukarı kırılım: {fmt_px(float(last.close))} > {fmt_px(high)}"
 
         ban = self.regime.vol_ban_until_ms
         rng = float(last.high) - float(last.low)
@@ -742,19 +773,62 @@ class Agent:
                         reason=f"son mum aralığı {rng:.4g} > {self.cfg.regime.vol_atr_mult:g}×ATR "
                                f"{float(last.atr):.4g} → {self.cfg.regime.vol_ban_sec // 60} dk yasak")
 
+        prev = self.regime
         self.regime = Regime(level=level, range_low=low, range_high=high, reason=reason,
                              computed_ms=now, vol_ban_until_ms=ban)
+        self.state.vol_ban_until_ms = ban
         print(f"rejim: {level} · {reason}")
 
+        # Rejim yorumcusu (LLM) — rejimle aynı anda, 30 dk'da bir. Fail-open; ajanı asla durdurmaz.
+        view = None
+        try:
+            view = await self.judge.regime_commentary(
+                self._h1_bars, level, low, high, reason)
+        except Exception as exc:  # judge fail-open'ı aşan beklenmedik hata bile döngüyü kesmez
+            self.decide("ERROR", gate="llm_regime", reason=f"{type(exc).__name__}: {exc}")
+        if view is not None:
+            self.state.regime_commentary = view.model_dump()
+            print(f"rejim yorumu ({view.status}, {view.model}): {view.view} güven={view.confidence} "
+                  f"çelişki={view.conflict} · {view.note}")
+
+        # Rejim değişimi (ve ilk hesap) karar günlüğüne düşer; LLM özeti aynı satırda.
+        if prev.computed_ms == 0 or prev.level != level:
+            extra = {"llm": view.model_dump()} if view is not None else {}
+            self.decide("CASH" if level == "CASH" else "WAIT", symbol=pair, gate="regime",
+                        range_low=low, range_high=high,
+                        reason=("rejim hesaplandı: " if prev.computed_ms == 0 else
+                                f"rejim değişti {prev.level} → {level}: ") + reason, **extra)
+
+    def _wait_detail(self, tracker: SetupTracker, row: Any) -> str:
+        """15m WAIT gerekçesi — SAYISAL: hangi koşul hangi değerle tutmadı (Faz 5 kalp atışı kuralı)."""
+        snap = tracker.snapshot()
+        close, bbl, rsi = float(row.close), float(row.bb_lower), float(row.rsi)
+        if snap["state"] == "WAITING":
+            return (f"kurulum bekliyor {snap['waited']}/{snap['trigger_window']}: tetik için close > BB_lower "
+                    f"{fmt_px(bbl)} ve > setup_low {fmt_px(snap['setup_low'])}; close {fmt_px(close)}")
+        if snap["state"] == "HOLDING":
+            return f"pozisyon açık, ufuk {snap['held']}/{snap['horizon']}"
+        thr = self.cfg.signal.rsi_setup_threshold
+        parts = []
+        if close >= bbl:
+            parts.append(f"close {fmt_px(close)} {'>' if close > bbl else '='} BB_lower {fmt_px(bbl)}")
+        if rsi >= thr:
+            parts.append(f"RSI {rsi:.1f} {'>' if rsi > thr else '='} {thr:g}")
+        return "; ".join(parts) if parts else "ısınma: indikatör henüz yok"
+
     async def signal_pass(self, bar_open_ts: int, orders_allowed: bool) -> bool:
-        """Kapanmış mumları takipçiye ver; aday çıkarsa kapılardan geçir. Emir oldu mu döner."""
-        await self.refresh_regime()
+        """Kapanmış mumları takipçiye ver; aday çıkarsa kapılardan geçir. Emir oldu mu döner.
+
+        Parite başına en az bir satır düşer: olay yoksa sayısal gerekçeli WAIT (Faz 5).
+        Rejim `tick()` içinde bundan ÖNCE tazelenir (değişim aynı mumda uygulansın).
+        """
         need = (self.cfg.signal.bb_period + self.cfg.signal.warmup_bars)
         acted = False
 
         for pair in self.pairs:
             df = await self.load_frame(pair, self.cfg.signal.bar, need)
             if df.empty:
+                self.decide("WAIT", symbol=pair, gate="data", reason="kapanmış mum gelmedi")
                 continue
             new = df[df["ts"] > self.state.last_signal_bar_ts] if self.state.last_signal_bar_ts else df.tail(1)
 
@@ -766,10 +840,13 @@ class Agent:
             # Olaylar mum mum çözülür: tetik PENDING bırakır ve `step()` PENDING'de hata atar,
             # yani aday AYNI turda kapılardan geçirilmek ZORUNDA. Sıra hatası sessiz kalamaz.
             tracker = self.trackers[pair]
+            logged = False
+            row = None
             for row in new.itertuples():
                 bar = Bar(int(row.ts), row.high, row.low, row.close,
                           row.bb_lower, row.bb_mid, row.rsi, row.atr)
                 for ev in tracker.step(bar):
+                    logged = True
                     if ev.kind is Ev.SETUP:
                         self.decide("SETUP", symbol=pair, price=float(row.close),
                                     rsi=round(float(row.rsi), 2), bb_lower=float(row.bb_lower),
@@ -784,19 +861,34 @@ class Agent:
                                     reason=f"stop mesafesi {ev.detail['stop_bps']:.1f}bps > "
                                            f"{self.cfg.risk.max_stop_bps}bps")
                     elif ev.kind is Ev.TRIGGER and not ev.detail.get("rejected"):
-                        placed = await self._handle_candidate(pair, ev, row, orders_allowed)
+                        placed = await self._handle_candidate(pair, ev, row, df, orders_allowed)
                         # Emir gönderildiyse ufuk tüketilir; herhangi bir kapı reddettiyse
                         # tracker IDLE'a döner ve bu parite SONRAKİ mumda yeni kurulum arar.
                         if tracker.pending:
                             tracker.confirm() if placed else tracker.reject()
                         acted = acted or placed
+            if not logged and row is not None and not np.isnan(row.rsi):
+                self.decide("WAIT", symbol=pair, gate="signal", price=float(row.close),
+                            rsi=round(float(row.rsi), 2), bb_lower=float(row.bb_lower),
+                            reason=self._wait_detail(tracker, row))
         return acted
 
-    async def _handle_candidate(
-        self, pair: str, ev: Any, bar_row: Any, orders_allowed: bool
-    ) -> bool:
-        """Aday: judge → mikro teyit → maliyet kapısı → risk kapısı → emir. Sıra ATLANMAZ.
+    def _recent_bars(self, df: pd.DataFrame) -> list[dict[str, Any]]:
+        """Yargıca giden son N kapanmış mum özeti (config llm.judge.recent_bars)."""
+        out = []
+        for r in df.tail(int(self.cfg.llm.judge.recent_bars)).itertuples():
+            out.append({"t": datetime.fromtimestamp(int(r.ts) / 1000, tz=self.tz).strftime("%H:%M"),
+                        "h": round(float(r.high), 6), "l": round(float(r.low), 6),
+                        "c": round(float(r.close), 6),
+                        "rsi": None if np.isnan(r.rsi) else round(float(r.rsi), 1)})
+        return out
 
+    async def _handle_candidate(
+        self, pair: str, ev: Any, bar_row: Any, df: pd.DataFrame, orders_allowed: bool
+    ) -> bool:
+        """Aday: mikro teyit → maliyet kapısı → LLM yargıç → risk kapısı → emir. Sıra ATLANMAZ.
+
+        Yargıç maliyet kapısından SONRA: elenen aday için LLM/haber çağrısı yapılmaz (Faz 5 kararı).
         True  = emir gönderildi → çağıran `tracker.confirm()` yapar, ufuk tüketilir.
         False = bir kapı reddetti → çağıran `tracker.reject()` yapar, ufuk TÜKETİLMEZ.
         """
@@ -820,19 +912,13 @@ class Agent:
         }
         self.decide("CANDIDATE", reason="tetik geldi, kapılara giriyor", **base)
 
-        # 1) judge — sadece fren
-        verdict = await judge(base, self.cfg, self.t)
-        if verdict.decision == "VETO":
-            self.decide("REJECT", gate="judge", reason=verdict.reason, **base)
-            return False
-
-        # 2) mikro teyit
+        # 1) mikro teyit
         ok, reason = self._micro_confirm(pair)
         if not ok:
             self.decide("REJECT", gate="micro", reason=reason, **base)
             return False
 
-        # 3) maliyet kapısı
+        # 2) maliyet kapısı
         spread, source = self.effective_spread(pair)
         ok, reason = cost_gate(target_bps, self.fee_bps, spread, self.cfg.cost.multiplier)
         if source == "fallback":
@@ -841,8 +927,22 @@ class Agent:
             self.decide("REJECT", gate="cost", reason=reason, spread_source=source, **base)
             return False
 
-        # 4) risk kapısı — 10 kontrol, strateji.md §4.6 sırasıyla
-        allowed, gate, reason, sz, px = await self._risk_gate(pair, stop_bps, orders_allowed)
+        # 3) LLM yargıç — SADECE FREN. Fail-open: LLM düşerse aday geçer, durum satıra işlenir.
+        try:
+            verdict: Verdict = await self.judge.judge(base, self._recent_bars(df))
+        except Exception as exc:  # judge'ın kendi fail-open'ını aşan hata bile adayı durdurmaz
+            verdict = Verdict(decision="APPROVE", size_multiplier=1.0, status="failed_open",
+                              reason=f"FAIL-OPEN: judge istisnası {type(exc).__name__}: {exc}"[:300])
+        base["llm"] = verdict.summary()  # adayın SONRAKİ satırı verdict özetini taşır
+        if verdict.decision == "VETO":
+            self.decide("REJECT", gate="judge", reason=f"LLM VETO ({verdict.model}): {verdict.reason}", **base)
+            return False
+        size_mult = float(verdict.size_multiplier) if verdict.decision == "REDUCE" else 1.0
+        print(f"JUDGE {pair}: {verdict.decision} ×{size_mult:g} [{verdict.status}/{verdict.model}] "
+              f"{verdict.reason}")
+
+        # 4) risk kapısı — 10 kontrol, strateji.md §4.6 sırasıyla (REDUCE çarpanı boyuta uygulanır)
+        allowed, gate, reason, sz, px = await self._risk_gate(pair, stop_bps, orders_allowed, size_mult)
         if not allowed:
             self.decide("REJECT", gate=gate, reason=reason, **base)
             return False
@@ -862,11 +962,12 @@ class Agent:
         return True, f"OBI {m['obi']:.3f}, spread {m['spread_bps']:.2f}bps"
 
     async def _risk_gate(
-        self, pair: str, stop_bps: float, orders_allowed: bool
+        self, pair: str, stop_bps: float, orders_allowed: bool, size_mult: float = 1.0
     ) -> tuple[bool, str, str, Decimal, Decimal]:
         """strateji.md §4.6 — 10 kontrol, SIRAYLA. İlk kapanan kapı döner; sonrakiler bakılmaz.
 
-        Aşılamaz katman: emre giden tek yol burası.
+        Aşılamaz katman: emre giden tek yol burası. `size_mult` (LLM REDUCE) yalnızca KÜÇÜLTÜR
+        (0.3–1.0, judge.py kırpar); minSz kontrolü çarpandan SONRA yapılır.
         """
         r, zero = self.cfg.risk, Decimal(0)
         now = now_ms()
@@ -906,6 +1007,7 @@ class Agent:
             notional = Decimal(str(dt.notional_usdt))
         else:
             notional = self.state.equity * Decimal(str(r.position_pct))
+        notional *= Decimal(str(min(1.0, max(0.0, size_mult))))  # LLM REDUCE: sadece küçültür
         # 7 stop bandı
         if stop_bps > r.max_stop_bps:
             return False, "risk_stop_band", f"stop {stop_bps:.1f}bps > {r.max_stop_bps}bps", zero, zero
@@ -924,7 +1026,8 @@ class Agent:
         sz = q_sz(notional / px, spec["lotSz"])
         if sz < spec["minSz"]:
             return False, "risk_instrument", \
-                f"sz {dstr(sz)} < minSz {dstr(spec['minSz'])} (yukarı yuvarlanmaz)", zero, zero
+                f"sz {dstr(sz)} < minSz {dstr(spec['minSz'])} (yukarı yuvarlanmaz" \
+                f"{f', LLM REDUCE ×{size_mult:g} sonrası' if size_mult < 1.0 else ''})", zero, zero
         # 9 bakiye
         avail = await self.t.get_avail_bal("USDT")
         if px * sz > avail:
@@ -935,7 +1038,8 @@ class Agent:
             return False, "risk_hour", \
                 f"{local:%H:%M} ≥ {self.cfg.execution.last_entry_local}, yeni giriş yok", zero, zero
 
-        return True, "", "10 kontrol geçti", sz, px
+        note = f"10 kontrol geçti" + (f" (LLM REDUCE ×{size_mult:g})" if size_mult < 1.0 else "")
+        return True, "", note, sz, px
 
     async def _place_entry(
         self, pair: str, px: Decimal, sz: Decimal, target: Decimal, stop: Decimal,
@@ -997,8 +1101,24 @@ class Agent:
 
     # ---- bekleyen emirler ve uzlaştırma ----
 
+    def _drop_pending(self, po: PendingOrder, gate: str, reason: str) -> None:
+        """Dolmayan emri düşür ve paritenin UFKUNU SERBEST BIRAK (Faz 5).
+
+        Emir gönderilince tracker HOLDING'e geçmişti; dolum olmadıysa pozisyon yok, ufuk tüketilmemeli:
+        `reject()` tracker'ı IDLE'a döndürür, parite SONRAKİ mumda yeni kurulum arayabilir.
+        """
+        if po in self.state.pending:
+            self.state.pending.remove(po)
+        tracker = self.trackers.get(po.pair)
+        released = False
+        if tracker is not None and tracker.state in ("HOLDING", "PENDING"):
+            tracker.reject()
+            released = True
+        self.decide("WAIT", symbol=po.pair, gate=gate, ord_id=po.ord_id,
+                    reason=reason + ("; ufuk serbest bırakıldı" if released else ""))
+
     async def check_pending(self) -> None:
-        """Her tur: dolan var mı, TTL doldu mu. 90 sn dolmazsa iptal, aday düşer."""
+        """Her tur: dolan var mı, TTL doldu mu. 90 sn dolmazsa iptal, aday düşer, ufuk serbest."""
         ttl = self.cfg.execution.limit_order_ttl_sec * 1000
         for po in list(self.state.pending):
             try:
@@ -1013,9 +1133,7 @@ class Agent:
             if state == "filled" or (filled > 0 and state in ("partially_filled", "")):
                 await self._promote(po, od, filled)
             elif state in ("canceled", "mmp_canceled"):
-                self.state.pending.remove(po)
-                self.decide("WAIT", symbol=po.pair, gate="fill",
-                            reason=f"emir iptal oldu (state={state}), aday düştü")
+                self._drop_pending(po, "fill", f"emir iptal oldu (state={state}), aday düştü")
             elif now_ms() - po.placed_ms > ttl:
                 if filled > 0:
                     await self._promote(po, od, filled)
@@ -1027,9 +1145,8 @@ class Agent:
                 except OkxToolError as exc:
                     self.order_log(symbol=po.pair, ord_id=po.ord_id, action="cancel", ok=False,
                                    error=str(exc.detail))
-                self.state.pending.remove(po)
-                self.decide("WAIT", symbol=po.pair, gate="fill",
-                            reason=f"{self.cfg.execution.limit_order_ttl_sec} sn'de dolmadı, iptal edildi")
+                self._drop_pending(po, "fill",
+                                   f"{self.cfg.execution.limit_order_ttl_sec} sn'de dolmadı, iptal edildi")
 
     async def _promote(self, po: PendingOrder, od: dict[str, Any], filled: Decimal) -> None:
         """Dolan emri pozisyona çevir. GERÇEK miktar fills'ten gelir (kısmi dolum olabilir)."""
@@ -1106,9 +1223,8 @@ class Agent:
                 if filled > 0:
                     await self._promote(po, od, filled)
                 else:
-                    self.state.pending.remove(po)
-                    self.decide("WAIT", symbol=po.pair, gate="reconcile",
-                                reason=f"emir borsada yok, dolum 0 (state={od.get('state')})")
+                    self._drop_pending(po, "reconcile",
+                                       f"emir borsada yok, dolum 0 (state={od.get('state')})")
 
         # Pozisyonların algoId'sini borsadan tazele; yoksa çıkış emri düşmüş demektir.
         for pos in self.state.positions:
@@ -1251,9 +1367,13 @@ class Agent:
             if pos.bars_held >= limit:
                 await self.close_now(pos, f"zaman stopu: {pos.bars_held} kapanmış mum ≥ {limit}")
 
-    async def flatten_all(self, reason: str) -> None:
+    async def flatten_all(self, reason: str) -> tuple[int, int]:
+        """Tüm pozisyonları kapat, bekleyenleri iptal et. (kapatılan, iptal edilen) sayısı döner."""
+        closed = cancelled = 0
         for pos in list(self.state.positions):
+            before = len(self.state.positions)
             await self.close_now(pos, reason)
+            closed += before - len(self.state.positions)
         for po in list(self.state.pending):
             try:
                 await self.t.cancel_order(po.pair, ord_id=po.ord_id)
@@ -1262,7 +1382,9 @@ class Agent:
             except OkxToolError as exc:
                 self.order_log(symbol=po.pair, ord_id=po.ord_id, action="cancel", ok=False,
                                error=str(exc.detail))
-            self.state.pending.remove(po)
+            self._drop_pending(po, "flatten", f"{reason}: bekleyen emir iptal")
+            cancelled += 1
+        return closed, cancelled
 
     # ---- tur ----
 
@@ -1272,11 +1394,18 @@ class Agent:
         mode = control["mode"]
         orders_allowed = mode == "run"
 
+        # Operatör eylemlerinin TEK kaynağı ajandır (dashboard yalnızca control.json yazar, Faz 5).
         # kill kendi (daha zengin) satırını aşağıda yazıyor; burada tekrarlamıyoruz.
-        if mode != getattr(self, "_last_mode", "run") and mode != "kill":
+        if mode != self._last_mode and mode != "kill":
             self.decide(f"OPERATOR_{mode.upper()}", reason=f"control.json mode={mode}")
             print(f"OPERATÖR: mode={mode}")
         self._last_mode = mode
+        if control["flatten"] and not self._last_flatten:
+            self.decide("OPERATOR_FLATTEN",
+                        reason=f"control.json flatten=true: {len(self.state.positions)} pozisyon, "
+                               f"{len(self.state.pending)} bekleyen emir kapatılacak")
+            print("OPERATÖR: flatten=true")
+        self._last_flatten = control["flatten"]
 
         if mode == "kill":
             # Acil Durdur: döngü TEMİZ çıkar. Pozisyonlar kapatılmaz — borsadaki TP/SL onları
@@ -1298,41 +1427,44 @@ class Agent:
         await self.check_pending()
 
         local = datetime.now(tz=self.tz)
-        flatten_now = control["flatten"] or local.time() >= parse_hhmm(self.cfg.execution.flatten_local)
-        if flatten_now and (self.state.positions or self.state.pending):
-            why = "operatör flatten" if control["flatten"] else \
-                f"gün sonu {self.cfg.execution.flatten_local}"
-            self.decide("OPERATOR_FLATTEN" if control["flatten"] else "CASH", reason=why)
+        eod = local.time() >= parse_hhmm(self.cfg.execution.flatten_local)
+        flatten_now = control["flatten"] or eod
+        if control["flatten"]:
+            # Operatör flatten: yürüt, bayrağı DÜŞÜR, bitişi logla. Bayrak açık kalırsa gün sonuna kadar
+            # yeni giriş kilitlenirdi (Faz 5 düzeltmesi). Gün sonu (eod) bayrağı ayrı; o düşürülmez.
+            why = "operatör flatten"
+            closed, cancelled = await self.flatten_all(why)
+            write_control({"flatten": False})
+            self._last_flatten = False
+            self.decide("OPERATOR_FLATTEN_DONE",
+                        reason=f"flatten yürütüldü: {closed} pozisyon kapatıldı, {cancelled} bekleyen "
+                               f"emir iptal edildi; control.json flatten=false")
+            print(f"OPERATÖR FLATTEN bitti: {closed} pozisyon, {cancelled} emir")
+        elif eod and (self.state.positions or self.state.pending):
+            why = f"gün sonu {self.cfg.execution.flatten_local}"
+            self.decide("CASH", reason=why)
             await self.flatten_all(why)
 
-        acted = False
         bar_ts = self.signal_due()
         if bar_ts is not None:
+            # Rejim ÖNCE tazelenir ki değişim aynı mumda uygulansın (B9); 30 dk'da bir gerçekten hesaplar.
+            await self.refresh_regime()
             entries_ok, why = self.regime.entries_allowed(now_ms())
-            acted = await self.signal_pass(bar_ts, orders_allowed and entries_ok and not flatten_now)
             if not entries_ok:
                 self.decide("WAIT", gate="regime", reason=why)
+            if not orders_allowed:
+                self.decide("WAIT", gate="control", reason=f"operatör {mode}: emir yok, değerlendirme sürüyor")
+            await self.signal_pass(bar_ts, orders_allowed and entries_ok and not flatten_now)
             self.state.last_signal_bar_ts = bar_ts
             await self.check_time_stops()
 
         if now_ms() - self.last_reconcile_ms >= self.cfg.execution.reconcile_sec * 1000:
             await self.reconcile()
 
-        if not acted:
-            self.decide("WAIT", reason=self._wait_reason(mode, bar_ts))
-
+        # Kalp atışı decisions.jsonl'e DEĞİL state.json'a (Faz 5): dashboard canlılığı buradan okur.
         self.state.last_turn_ms = now_ms()
+        self.state.last_tick_ts = datetime.now(tz=self.tz).isoformat(timespec="seconds")
         self.state.save()
-
-    def _wait_reason(self, mode: str, bar_ts: int | None) -> str:
-        if mode != "run":
-            return f"operatör {mode}: emir yok, veri toplanıyor"
-        entries_ok, why = self.regime.entries_allowed(now_ms())
-        if not entries_ok:
-            return why
-        if bar_ts is None:
-            return f"{self.cfg.signal.bar} kapanışı bekleniyor; mikro örnekleme sürüyor"
-        return "kurulum yok: hiçbir paritede BB alt bandı + RSI eşiği birlikte gelmedi"
 
     async def run(self) -> int:
         await self.startup()

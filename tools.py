@@ -52,6 +52,7 @@ BAR_MS: dict[str, int] = {
 CANDLES_MAX_LIMIT = 300
 FILTER_MAX_LIMIT = 100
 INDICATOR_MAX_LIMIT = 100
+NEWS_MAX_LIMIT = 20  # news_* limit tavanı ölçülmedi; LLM girdisi zaten 5 ile sınırlı, 20 emniyet payı
 
 # Emir araçları: bunlarda YENİDEN DENEME YOK (çift emir riski). `_call` assert ile zorlar.
 ORDER_TOOLS: frozenset[str] = frozenset(
@@ -171,6 +172,20 @@ def _decimalize(value: Any, key: str | None = None) -> Any:
     return value
 
 
+class LenientSession(ClientSession):
+    """`ClientSession` — araç çıktısının `output_schema` doğrulaması KAPALI.
+
+    NEDEN (Faz 5'te ölçüldü): `mcp` 2.2 istemcisi `call_tool` sonrası sonucu aracın `output_schema`'sına
+    göre doğruluyor ve `smartmoney_get_signal_overview_by_filter` için `structured_content`'te
+    `endpoint` yok diye `RuntimeError` atıyor — oysa `content[0].text` içindeki ham zarf sağlam ve
+    standart. Biz `structured_content`'i HİÇ kullanmıyoruz (`_call_once` yalnızca metni parse eder),
+    dolayısıyla bu doğrulama bize hiçbir şey kazandırmıyor, yalnızca veriyi düşürüyor.
+    """
+
+    async def validate_tool_result(self, name: str, result: Any) -> None:  # noqa: ARG002
+        return None
+
+
 class OkxTools:
     """`okx-trade-mcp` stdio oturumu. Async context manager olarak kullanılır.
 
@@ -204,7 +219,7 @@ class OkxTools:
     async def __aenter__(self) -> "OkxTools":
         self._stack = AsyncExitStack()
         read, write = await self._stack.enter_async_context(stdio_client(self._params))
-        self._session = await self._stack.enter_async_context(ClientSession(read, write))
+        self._session = await self._stack.enter_async_context(LenientSession(read, write))
         await self._session.initialize()
         return self
 
@@ -414,6 +429,61 @@ class OkxTools:
         """Son işlemler, en yeniden eskiye. `side` = agresörün (taker'ın) yönü."""
         rows = await self._call("market_get_trades", {"instId": inst_id, "limit": limit})
         return [_decimalize(r) for r in rows]
+
+    async def get_funding_rate(self, inst_id: str) -> dict[str, Any]:
+        """`market_get_funding_rate` — SWAP fonlama oranı (yargıç girdisi). Tek satır, HAM string alanlar.
+
+        Örnek (Faz 5'te ölçüldü): {fundingRate, nextFundingRate, premium, fundingTime, nextFundingTime,
+        settFundingRate, ...}. Decimal'e çevrilmez: LLM'e JSON olarak gidecek.
+        """
+        rows = await self._call("market_get_funding_rate", {"instId": inst_id})
+        return rows[0] if rows else {}
+
+    # ---- news (yargıç ve rejim yorumcusu girdisi; hepsi salt okunur) ----
+    #
+    # Zarf (Faz 5'te ölçüldü): standart üç kat + `details` katmanı:
+    #   payload.data.data = [{"details": [...], "period": ..., "ts": ...}]
+    # Alanlar string; Decimal'e çevrilmez (LLM'e JSON olarak gidecek).
+
+    async def get_news_by_coin(
+        self, coins: str, importance: str = "high", limit: int = 5, detail_lvl: str = "brief"
+    ) -> list[dict[str, Any]]:
+        """`news_get_by_coin`. Öğe: {id, title, importance, ccyList, ccySentiments:[{ccy,sentiment}],
+        cTime, sourceUrl, summary, content}. brief'te summary/content boş gelir; başlık + duygu yeterli."""
+        args = {"coins": coins, "importance": importance,
+                "limit": min(int(limit), NEWS_MAX_LIMIT), "detailLvl": detail_lvl}
+        rows = await self._call("news_get_by_coin", args)
+        return list(rows[0].get("details") or []) if rows else []
+
+    async def get_coin_sentiment(self, coins: str, period: str = "1h") -> list[dict[str, Any]]:
+        """`news_get_coin_sentiment`. Öğe: {ccy, mentionCnt, newsMentionCnt, xMentionCnt,
+        sentiment:{label, bullishRatio, bearishRatio, bullishCnt, bearishCnt, neutralCnt}}."""
+        rows = await self._call("news_get_coin_sentiment", {"coins": coins, "period": period})
+        return list(rows[0].get("details") or []) if rows else []
+
+    async def get_sentiment_ranking(self, period: str = "4h", limit: int = 5) -> list[dict[str, Any]]:
+        """`news_get_sentiment_ranking`. `get_coin_sentiment` ile aynı öğe şekli, çok ccy."""
+        args = {"period": period, "limit": min(int(limit), NEWS_MAX_LIMIT)}
+        rows = await self._call("news_get_sentiment_ranking", args)
+        return list(rows[0].get("details") or []) if rows else []
+
+    # ---- smartmoney (rejim yorumcusu girdisi) ----
+
+    async def get_smartmoney_overview(
+        self, inst_ccy_list: list[str], sort_by: str = "pnl", period: str = "7",
+        top_instruments: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """`smartmoney_get_signal_overview_by_filter`. Öğe (ccy başına): {ccy, longShortRatio:{longRatio,
+        shortRatio, longRatioVs1h/24h/7d, weightedLongRatio}, notional:{longNotionalUsdt, shortNotionalUsdt,
+        netNotionalUsdt}, winRate:{avgLongWinRate, avgShortWinRate}, longTraders, shortTraders}.
+
+        DİKKAT: `mcp` istemcisinin çıktı doğrulaması bu araçta sahte hata veriyor; `LenientSession` kapatıyor.
+        """
+        args: dict[str, Any] = {"instCcyList": list(inst_ccy_list), "sortBy": sort_by, "period": str(period)}
+        if top_instruments is not None:
+            args["topInstruments"] = int(top_instruments)
+        rows = await self._call("smartmoney_get_signal_overview_by_filter", args)
+        return list(rows or [])
 
     # ---- account ----
 

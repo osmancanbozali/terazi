@@ -123,6 +123,17 @@ class SetupTracker:
         """Tetik geldi, kapıların sonucu bekleniyor. `confirm()` ya da `reject()` şart."""
         return self._state == "PENDING"
 
+    @property
+    def state(self) -> str:
+        """IDLE | WAITING | PENDING | HOLDING — salt okunur (terazi.py'nin 15m WAIT gerekçesi için)."""
+        return self._state
+
+    def snapshot(self) -> dict[str, Any]:
+        """Gerekçe üretimi için sayısal iç durum (setup_low, kaç mum beklendi, kaç mum tutuldu)."""
+        return {"state": self._state, "setup_low": self._setup_low, "waited": self._waited,
+                "held": self._held, "horizon": self.target_horizon,
+                "trigger_window": self.trigger_window}
+
     def confirm(self) -> None:
         """Aday tüm kapıları geçti ve emir gönderildi → ufuk tüketilmeye başlar."""
         if self._state != "PENDING":
@@ -131,9 +142,14 @@ class SetupTracker:
         self._held = 0
 
     def reject(self) -> None:
-        """Aday bir kapıda reddedildi → ufuk TÜKETİLMEZ, sonraki mum yeni kurulum olabilir."""
-        if self._state != "PENDING":
-            raise RuntimeError(f"reject() PENDING dışında çağrıldı (state={self._state})")
+        """Aday reddedildi → ufuk TÜKETİLMEZ, sonraki mum yeni kurulum olabilir.
+
+        İki geçerli an: PENDING (bir kapı reddetti) ve HOLDING (emir gönderildi ama 90 sn'de dolmadan
+        iptal edildi / borsada hiç dolmadı — Faz 5: dolmayan emir ufuk tüketmesin). IDLE/WAITING'de
+        çağrılması sıra hatasıdır, sessiz kalmaz.
+        """
+        if self._state not in ("PENDING", "HOLDING"):
+            raise RuntimeError(f"reject() PENDING/HOLDING dışında çağrıldı (state={self._state})")
         self._reset()
 
     def step(self, bar: Bar) -> list[Event]:
