@@ -32,6 +32,8 @@ from pydantic import BaseModel
 LOGS = Path("logs")
 DECISIONS = LOGS / "decisions.jsonl"
 ORDERS = LOGS / "orders.jsonl"
+MICRO = LOGS / "micro.jsonl"
+LLM_LOG = LOGS / "llm.jsonl"
 STATE = Path("state.json")
 CONTROL = Path("control.json")
 CONFIG = Path("config.yaml")
@@ -43,6 +45,12 @@ TAIL_BYTES = 1_000_000
 
 MODES = ("run", "pause", "kill")
 CONFIRM_REQUIRED = ("kill", "flatten")
+
+# Faz 6 uç varsayılanları. Eşik değil, pencere/çizim tavanı; `dashboard:` bloğuna taşınabilir
+# (bkz. STATUS.md Faz 6 açık işleri) — blok yokken bunlar geçerli.
+LLM_PANEL_ROWS = 5        # GET /llm varsayılanı (alt şeritteki kart 5 satır gösteriyor)
+MICRO_WINDOW_MIN = 30     # GET /micro varsayılan pencere (strateji.md §4.3 medyan penceresi)
+EQUITY_MAX_POINTS = 400   # equity eğrisinde çizilecek en fazla nokta (seyreltme tavanı)
 
 # decisions.jsonl'de görülebilen action değerleri (docs/urun-mimari.md §3.3).
 # OPERATOR_* tek kovada toplanır: ajan mode değişiminde OPERATOR_RUN yazarken spec
@@ -238,6 +246,41 @@ def derive_kill(state: dict[str, Any], control: dict[str, Any]) -> dict[str, Any
     }
 
 
+def to_float(value: Any) -> float | None:
+    """Log alanları string gelir (fiyat/equity hassasiyeti için). Çizim için float gerekiyor;
+    boş string ve None sessizce None olur, çizgi orada kopar."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def llm_summary(row: dict[str, Any]) -> dict[str, Any]:
+    """`llm.jsonl` satırı → panel satırı. İki görev tek kartta: `judge` verdict taşır,
+    `regime` view + güven taşır. `status` ok / fallback / failed_open olarak renklenir."""
+    out = row.get("output") or {}
+    if not isinstance(out, dict):
+        out = {}
+    return {
+        "ts": row.get("ts"),
+        "task": row.get("task"),
+        "symbol": row.get("symbol"),
+        "model": row.get("model"),
+        "status": row.get("status"),
+        "latency_ms": row.get("latency_ms"),
+        "verdict": out.get("decision"),
+        "size_multiplier": out.get("size_multiplier"),
+        "news_risk": out.get("news_risk"),
+        "view": out.get("view"),
+        "confidence": out.get("confidence"),
+        "conflict": bool(out.get("conflict")),
+        "text": out.get("reason") or out.get("note") or "",
+        "missing_inputs": row.get("missing_inputs") or out.get("missing_inputs") or [],
+    }
+
+
 def order_summary(row: dict[str, Any]) -> dict[str, Any]:
     """Emir satırının özeti. Başarısız emir `ok: true` zarfının İÇİNDE saklanıyor (STATUS.md #19):
     gerçek sonuç `response.sCode`'da, `"0"` dışındaki her değer redde eşit.
@@ -327,6 +370,81 @@ def get_orders() -> dict[str, Any]:
     return {"rows": [order_summary(r) for r in reversed(rows)], "skipped": skipped, "count": len(rows)}
 
 
+@app.get("/llm")
+def get_llm(n: int = LLM_PANEL_ROWS) -> dict[str, Any]:
+    """LLM paneli: `llm.jsonl` son n satırı, EN YENİ ÖNCE. `attempts` ve `input_summary` kırpılır —
+    panel verdict/view, status ve gecikmeyi gösteriyor, ham girdi özetini göstermiyor."""
+    n = max(1, min(n, 50))
+    rows, skipped = read_jsonl_tail(LLM_LOG, n)
+    return {"rows": [llm_summary(r) for r in reversed(rows)], "skipped": skipped,
+            "count": len(rows)}
+
+
+@app.get("/equity")
+def get_equity() -> dict[str, Any]:
+    """Equity eğrisi. Kaynak `decisions.jsonl`: her satırda `equity` var (string!). Ardışık aynı
+    değerler seyreltilir — 30 USDT'lik hesapta yüzlerce satır aynı sayıyı taşıyor."""
+    rows, skipped = read_jsonl_tail(DECISIONS)
+    state = read_json(STATE)
+
+    points: list[dict[str, Any]] = []
+    last: float | None = None
+    pending: dict[str, Any] | None = None  # düz kesimin son noktası
+    for r in rows:
+        val = to_float(r.get("equity"))
+        ts = r.get("ts")
+        if val is None or not ts:
+            continue
+        point = {"ts": ts, "equity": val}
+        if last is None or val != last:
+            if pending is not None:
+                points.append(pending)  # düz kesimin İKİ ucu da çizilir, ortası atılır
+                pending = None
+            points.append(point)
+            last = val
+        else:
+            pending = point
+    if pending is not None:
+        points.append(pending)
+
+    if len(points) > EQUITY_MAX_POINTS:  # çok nokta → eşit aralıklı seyreltme, son nokta korunur
+        step = len(points) / EQUITY_MAX_POINTS
+        thin = [points[int(i * step)] for i in range(EQUITY_MAX_POINTS)]
+        if thin[-1] is not points[-1]:
+            thin.append(points[-1])
+        points = thin
+
+    return {"points": points, "count": len(points),
+            "day_start_equity": to_float(state.get("day_start_equity")),
+            "daily_pnl_pct": state.get("daily_pnl_pct"), "skipped": skipped}
+
+
+@app.get("/micro")
+def get_micro(minutes: int = MICRO_WINDOW_MIN) -> dict[str, Any]:
+    """Mikro sparkline'lar: `micro.jsonl`'in son `minutes` dakikası, parite başına OBI ve
+    spread_bps serisi (strateji.md §4.3 — bu katman 20 sn'de bir örnekliyor)."""
+    minutes = max(1, min(minutes, 240))
+    rows, skipped = read_jsonl_tail(MICRO)
+    cutoff = datetime.now(tz=CFG["tz"]).timestamp() - minutes * 60
+
+    series: dict[str, dict[str, list[Any]]] = {}
+    for r in rows:
+        sym = str(r.get("symbol") or "")
+        age = age_sec(r.get("ts"))
+        if not sym or age is None or age > minutes * 60:
+            continue
+        s = series.setdefault(sym, {"ts": [], "obi": [], "spread_bps": []})
+        s["ts"].append(r.get("ts"))
+        s["obi"].append(to_float(r.get("obi")))
+        s["spread_bps"].append(to_float(r.get("spread_bps")))
+
+    out = {sym: {**s, "last_obi": s["obi"][-1] if s["obi"] else None,
+                 "last_spread_bps": s["spread_bps"][-1] if s["spread_bps"] else None,
+                 "samples": len(s["ts"])}
+           for sym, s in series.items()}
+    return {"minutes": minutes, "cutoff_ts": cutoff, "pairs": out, "skipped": skipped}
+
+
 class ControlBody(BaseModel):
     mode: str | None = None
     flatten: bool | None = None
@@ -366,6 +484,70 @@ def post_control(body: ControlBody) -> dict[str, Any]:
 
     control = write_control(patch)
     return {"ok": True, "action": action, "control": control}
+
+
+# ----------------------------------------------------------------------------
+# "Ajana sor" — ask.py TEMBEL import edilir
+# ----------------------------------------------------------------------------
+#
+# ask.py `anthropic`, `judge`, `terazi` ve `tools`'u çekiyor. Bu zincirde bir sorun varsa
+# dashboard'un geri kalanı (karar akışı, kontroller) ETKİLENMEMELİ — ajan çökse bile ayakta kalma
+# ilkesinin ikizi (docs/urun-mimari.md §3.1). Bu yüzden import ilk /ask isteğinde yapılır ve
+# düşerse yalnızca bu uç 503 döner.
+
+_ask_mod: Any = None
+_ask_error: str | None = None
+
+QUESTION_MAX_CHARS = 600   # ask.py ile aynı tavan; burada erken 400 vermek için
+HISTORY_MAX_MESSAGES = 20  # gövde şişirme koruması; ask.py zaten son 6'yı gönderiyor
+
+
+def load_ask() -> Any:
+    global _ask_mod, _ask_error
+    if _ask_mod is None and _ask_error is None:
+        try:
+            import ask  # noqa: PLC0415 — bilerek tembel
+
+            _ask_mod = ask
+        except Exception as exc:  # noqa: BLE001 — import zincirinin tamamı
+            _ask_error = f"{type(exc).__name__}: {exc}"
+            print(f"ask.py yüklenemedi: {_ask_error}", file=sys.stderr)
+    return _ask_mod
+
+
+class AskMessage(BaseModel):
+    role: str = "user"
+    content: str = ""
+
+
+class AskBody(BaseModel):
+    question: str
+    history: list[AskMessage] = []
+
+
+@app.post("/ask")
+async def post_ask(body: AskBody) -> dict[str, Any]:
+    """Salt okunur sohbet. Emir vermez, config değiştirmez, control.json'a dokunmaz."""
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Soru boş.")
+    if len(question) > QUESTION_MAX_CHARS:
+        raise HTTPException(status_code=400,
+                            detail=f"Soru çok uzun ({len(question)} > {QUESTION_MAX_CHARS} karakter).")
+
+    mod = load_ask()
+    if mod is None:
+        raise HTTPException(status_code=503,
+                            detail=f"Sohbet katmanı yüklenemedi: {_ask_error}")
+
+    history = [{"role": m.role, "content": m.content}
+               for m in body.history[-HISTORY_MAX_MESSAGES:] if m.content.strip()]
+    try:
+        return await mod.answer(question, history)
+    except Exception as exc:  # noqa: BLE001 — ask.answer istisna fırlatmamalı; fırlatırsa 500
+        print(f"/ask beklenmeyen hata: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise HTTPException(status_code=500,
+                            detail=f"Sohbet hatası: {type(exc).__name__}: {exc}") from exc
 
 
 @app.exception_handler(HTTPException)

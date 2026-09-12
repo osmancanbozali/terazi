@@ -169,20 +169,11 @@ def _dump(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
-def _two_sentences(text: str) -> str:
-    """En fazla iki cümle: '.', '!' veya '?' ile biten parçalardan ilk ikisi."""
-    parts: list[str] = []
-    buf = ""
-    for ch in text:
-        buf += ch
-        if ch in ".!?":
-            parts.append(buf.strip())
-            buf = ""
-            if len(parts) == 2:
-                break
-    if len(parts) < 2 and buf.strip():
-        parts.append(buf.strip())
-    return " ".join(parts)
+# NOT: burada bir `_two_sentences()` vardı ve notu ilk iki "cümleden" sonra kesiyordu. Nokta
+# sayısal ayırıcı olarak da kullanıldığı için "77.000" içindeki noktayı cümle sonu sayıyordu:
+# 12 Eylül 14:11'de üretilen not "BTC son 24 saattir 77. 000-77." olarak kesildi. Cümle sayısı
+# zaten REGIME_SYSTEM'de isteniyor ("at most TWO sentences"); kod yalnızca uzunluk sınırını
+# zorluyor (`_clip`). Faz 6'da kaldırıldı.
 
 
 # ----------------------------------------------------------------------------
@@ -452,7 +443,7 @@ class Judge:
             conflict = (rule_level == "MEAN_REVERSION" and v == "trend") or (rule_level == "CASH" and v == "range")
             view = RegimeView(
                 view=v, confidence=round(conf, 2), conflict=conflict, rule_level=rule_level,  # type: ignore[arg-type]
-                note=_clip(_two_sentences(str(data.get("note", ""))), int(self.llm.reason_max_chars)),
+                note=_clip(str(data.get("note", "")), int(self.llm.reason_max_chars)),
                 status=meta["status"], model=meta["model"], missing_inputs=missing, ts=self._now(),
             )
         self._log({

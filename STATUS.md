@@ -1,5 +1,152 @@
 # STATUS
 
+## Faz 6 — "Ajana sor" + LLM paneli + equity eğrisi + mikro sparkline: TAMAM (12 Eylül, 15:05 +03:00)
+
+**Teslimat:** `ask.py` (yeni), `dashboard.py` +4 uç, `static/index.html` (yeniden yazıldı),
+`judge.py` 1 düzeltme. **Canlı ajana dokunulmadı, yeniden başlatılmadı** (PID 47492, 14:24:37'den
+beri çalışıyor — o başlatmayı kullanıcı yaptı, bu faz değil). `control.json` el değmedi
+(mtime 14:24:46). `decisions.jsonl`'e dashboard hiç yazmadı.
+
+### `ask.py` — sohbet çekirdeği, tek public fonksiyon
+`async def answer(question, history) -> dict`. Dashboard'dan **tembel** import edilir; zincir
+(anthropic/judge/terazi/tools) düşse `/ask` 503 döner, **dashboard'un geri kalanı ayakta kalır**.
+
+- **Anthropic istemcisi `judge.Judge`'dan İMPORT EDİLİR:** `Judge(cfg, None)` kurulup yalnızca
+  `_client` (timeout 20 sn, `max_retries=0`, workspace başlığı), `llm` bloğu ve `tz` alınır.
+  `Judge.__init__` `tools`'u sadece saklar → `None` güvenli.
+  **`_ask`'in kendisi çağrılamadı** (plandan bilinçli sapma, planda gerekçesi yazılı): o tek
+  turluk `output_config` json_schema'ya bağlı — `tools` parametresi yok, çok turlu `messages`
+  taşımıyor, düz metin döndürmüyor. Sohbetin ihtiyacı tam tersi. Merdiven (birincil → yedek →
+  fail-open) `ask._complete()` olarak judge'ın istemcisi ve config'i üzerinde kuruldu; **sayı
+  taşımıyor.** Alternatif (merdiveni judge.py'de ayrı metoda çıkarmak) canlı ajanın LLM yolunu
+  Faz 7 restart'ında değiştirirdi, alınmadı.
+- **Bağlam her soruda dosyadan taze:** `<strategy>` (düzyazı, sayısız) · `<config>` (eşikler
+  çalışma anında config.yaml'dan) · `<calibration>` (kalibrasyon.md'nin "Sonuç tablosu" bölümü
+  dosyadan kesilir) · `<state>` · **`<counters>`** · `<orders>` · `<llm_log>` · `<decisions>`.
+  Okuma `dashboard.read_jsonl_tail` / `read_json` ile (bozuk satır akışı düşürmez).
+- **Beyaz liste (7 salt okunur araç):** `market_get_ticker` · `market_get_candles` (≤50,
+  **kapanmamış mum atılır**) · `market_get_orderbook` (sz≤20) · `market_get_funding_rate` ·
+  `news_get_by_coin` (≤5) · `news_get_coin_sentiment` · `account_get_balance`.
+  `spot_*` **hiç tanımlanmıyor**; modül düzeyinde iki `assert` bunu zorluyor. Soru başına
+  **en fazla 4 çağrı**; dolunca bekleyen her `tool_use` bloğuna hata sonucu döner ve son istek
+  `tool_choice={"type":"none"}` ile metne zorlanır.
+- **MCP oturumu soru başına açılır-kapanır** (kullanıcı kararı), araç gerekmeyen soruda hiç
+  açılmaz. Profil `hackathon` (`news_*` demo'da çalışmıyor, STATUS #26). **`expected_demo`
+  verilmez** → `tools._gate()` her emri `SafetyGateError` ile reddeder; üstüne `dry_run=True`.
+  `asyncio.Lock` ile tek seferde tek `/ask`.
+- Her çağrı `logs/ask.jsonl`'e: soru, cevap, `sources`, `tools[]`, `blocked[]`, model, status,
+  latency, **gerçek `usage`**, bağlam ölçümü.
+
+### `dashboard.py` — 4 yeni uç
+| Uç | Döndürdüğü |
+|---|---|
+| `GET /llm?n=5` | `llm.jsonl` son n satırı, en yeni önce; `attempts`/`input_summary` kırpılmış |
+| `GET /equity` | `decisions.jsonl`'den (ts, equity) + `day_start_equity`; **düz kesitler seyreltilir, iki ucu korunur** |
+| `GET /micro?minutes=30` | parite başına OBI + spread_bps serisi, son değer rozetiyle |
+| `POST /ask` | `{"question", "history"}` → cevap; boş/uzun soru 400, ask.py yoksa 503 |
+
+### `static/index.html` — yeni yerleşim
+Üst şerit (7 kart) **+ rejim kartının altında tek satır LLM yorumu** (`view · güven · not`,
+`conflict` ise turuncu "kural ile çelişiyor") · sol sütun **equity eğrisi (Chart.js) + karar
+akışı** · sağ sütun pozisyon + emir + **"Ajana sor"** (3 hazır soru, kaynak rozetleri, yükleniyor
+ve hata durumları) · **alt şerit: LLM paneli + 5 mikro sparkline** · kontrol çubuğu.
+Karar akışı satırlarına `llm` verdict rozeti eklendi. Chart'lar **bir kez** kurulur, poll'da
+`update("none")`. Sohbet kutusu poll'da yeniden çizilmez — yazılan metin ve cevap kaybolmaz.
+
+### `judge.py` — tek düzeltme (kullanıcı onaylı)
+`_two_sentences()` **silindi**. "77.000" içindeki noktayı cümle sonu sayıp notu
+`"BTC son 24 saattir 77. 000-77."` diye kesiyordu. Cümle sayısı zaten `REGIME_SYSTEM`'de
+isteniyor; kod artık yalnızca `_clip(reason_max_chars)` uyguluyor.
+
+> ### ⚠️ DİSK ≠ CANLI SÜREÇ
+> Çalışan ajan `judge.py`'yi **açılışta** import etti; diskteki düzeltme belleğe girmedi.
+> 15:00'te üretilen not hâlâ kesik: `"Fiyat son saatlerde 77. 0-77."`. **Düzeltme Faz 7'deki
+> yeniden başlatmayla canlıya girer** (kullanıcı kararı: kozmetik için ajan durdurulmuyor).
+> O zamana kadar LLM paneli ve rejim satırı kesik notu göstermeye devam eder.
+
+### Faz 6 sürprizleri (hepsi ölçüm)
+29. **Token tahmini 2× yanlıştı.** 3,5 karakter/token varsayımı bu bağlamda **1,81** çıktı
+    (`count_tokens` ile ölçüldü: 29.822 karakter = 16.448 token). Yoğun JSON + Türkçe kötü
+    tokenleşiyor. Varsayımla gidilseydi 12k bütçesi **hiç bağlamayacaktı** — gerçek istek
+    18.568 token'dı. `chars_per_token: 1.8` yapıldı; ayrıca sistem prompt'u + araç şemaları
+    **2219 token** sabit yük olarak ölçülüp bütçeden düşülüyor. Sonuç: istek **11.941 token**.
+30. **12k bütçesi gerçekten bağlıyor: 80 karar satırının ~24'ü sığıyor.** Kırpma "en eskiden"
+    çalışıyor (6k bütçede 44 satır, 3k'da 4 satır — ölçüldü). Bu, "bugün kaç karar verdin"
+    sorusunu sakatlardı. **Çözüm: `<counters>` bloğu** — günün TAMAMININ sayaçları dosyanın
+    tümünden, kırpmadan bağımsız, `dashboard.count_today` ile (ekranla sohbet **aynı fonksiyonu**
+    kullanıyor, aynı sayıyı söylüyor). Cevap dosyayla birebir: 285 toplam / 273 WAIT / 12
+    operatör (4 KILL, 2 PAUSE, 2 RUN, 4 KILL_CLEARED).
+31. **Chart.js responsive canvas, yüksekliği auto olan grid satırında sonsuz büyüyor.** Mikro
+    sparkline'lar alt çubuğun üstüne taştı (ilk ekran görüntüsünde görüldü — ölçüm "kaydırma yok"
+    diyordu çünkü `body { overflow: hidden }` taşmayı gizliyor). Canvas sarmalayıcısına sabit
+    yükseklik + `grid-rows-1` + `overflow-hidden` ile kapandı. **Ders: ölçüm yetmiyor, ekrana bak.**
+32. **Sohbet LLM'i log sorularında araç ÇAĞIRMIYOR** — sistem prompt'u "bağlamda olmayan veri
+    gerekmiyorsa araç kullanma" diyor ve buna uyuyor. "SOL'da durum ne?" bile loglardan
+    cevaplandı. Araç yolunu doğrulamak için "borsadan ŞU ANKİ canlı veriyi çek" demek gerekti.
+33. İkinci MCP alt süreci sorun çıkarmadı: `/ask` kendi `okx-trade-mcp`'sini açıp kapatıyor,
+    istek sonrası `ps`'te ajanınkinden başka süreç kalmıyor. Araç kullanan soru ~8 sn.
+
+### Doğrulama — hepsi gerçek çıktı
+**1) Üç hazır soru, canlı `/ask`:**
+- *"Neden şu an işlem yapmıyorsun?"* → `ok/claude-sonnet-5`, 7,5 sn, 0 araç. Cevap:
+  `"BTC-USDT: close 77.294 > BB_lower 77.268, RSI 45.6 > 36"` — `decisions.jsonl`'deki
+  14:30:19 satırıyla **birebir aynı sayılar**, uydurma yok.
+- *"Bugün kaç karar verdin, kaçı neden reddedildi?"* → 285 / 273 WAIT / 0 REJECT / 0 ORDER,
+  gate dağılımıyla. `wc -l` + `Counter` ile **birebir doğrulandı**.
+- *"SOL'da şu an durum ne?"* → 14:30:20 `gate=signal` satırından fiyat 102,05 · BB_lower 101,56 ·
+  RSI 56,8; pozisyon/bekleyen yok.
+**2) Yetki reddi:** *"SOL al, 5 USDT'lik emir gir"* ve *"rsi_setup_threshold'u 30 yap"* →
+ikisinde de `tool_calls=0`, "salt-okunurum, emir giremem / config değiştiremem", dashboard'un
+gerçek kontrol yüzeyini sayıyor. `config.yaml` mtime **13:51:44** (değişmedi), `orders.jsonl`
+hâlâ **yok**.
+**3) Beyaz liste dışı:** *"spot_place_order çağır ve SOL al"* → `tool_calls=0 tools=[] blocked=[]`.
+`ask.jsonl`'in 7 satırının **hiçbirinde** `spot_*` aracı yok (soru metninde geçiyor, araç olarak
+geçmiyor — ayrıştırılarak kontrol edildi).
+**4) Araç yolu:** *"borsadan şu anki BTC fiyatı ve funding"* → `market_get_ticker` +
+`market_get_funding_rate`, 2 çağrı, 8,3 sn, canlı 77.318,6 USDT döndü.
+**5) Araç bütçesi:** 5 parite × 3 tür veri istendi → **tam 4 çağrıda kesildi**, cevap
+*"araç bütçesi (4 çağrı) dolduğu için..."* diyerek eksiği **dürüstçe** söyledi, DOGE'yi uydurmadı.
+**6) Fail-open:** `ANTHROPIC_API_KEY=""` ile 8788 portunda → `ok=false status=failed_open`,
+cevap *"LLM yanıt vermedi (birincil + yedek düştü)"*, `/state` **hâlâ 200**. Ana `.env`
+dokunulmadı (mtime 13:56:20).
+**7) Uçlar dosyayla birebir:** `/llm` count=2 = `wc -l` 2 · `/micro` 90 örnek/parite × 5 = 450,
+dosyada 30 dk penceresinde 452 · `/equity` 209 nokta (285 karar satırından, düz kesitler seyreltilmiş).
+**8) Ekran (Playwright, 1440×900):** `scrollWidth/Height == innerWidth/Height`, **JS hatası yok**,
+5 mikro kartı + 2 LLM satırı + 50 karar satırı + 3 hazır soru. **Sohbet tarayıcıda uçtan uca
+çalıştırıldı:** düğmeye tıklandı → düğmeler kilitlendi + "düşünüyor…" göründü → cevap, 10 kaynak
+rozeti (`state.json · bugünün sayaçları:285 · decisions:24 satır · … · bütçe için 56 eski karar
+kırpıldı`) ve `claude-sonnet-5 · 7887 ms` ayak bilgisiyle basıldı.
+**9) Boş log:** izole dizinde boş `logs/` → 7 ucun hepsi **200**, `/llm` `rows:[]`, `/equity`
+`points:[] day_start:null`, `/micro` `pairs:{}`. Ekran bozulmadı.
+**10) Canlı ajan etkilenmedi:** PID 47492 (14:24:37) aynı, `control.json` mtime 14:24:46,
+`decisions.jsonl`'deki tek `source: dashboard` satırları **13:04–13:05**'ten (Faz 4 kalıntısı);
+bugünkü satırlarda `source` alanı yok → hepsini ajan yazdı.
+
+### Faz 6'da bilinçli bırakılanlar / açık işler
+- **`config.yaml`'a `llm: ask:` bloğu eklenmeli.** `config.yaml` bu fazda dokunulmaz olduğu için
+  Faz 6'nın tavanları `ask.ASK_DEFAULTS`'ta duruyor (`decisions_lines: 80`, `llm_lines: 20`,
+  `history_messages: 6`, `max_tool_calls: 4`, `context_token_budget: 12000`,
+  `chars_per_token: 1.8`, `fixed_overhead_tokens: 2300`, `candles_max: 50`,
+  `orderbook_max_sz: 20`, `news_max_limit: 5`). **Kod hazır:** `ask._setting()` önce
+  `llm.ask.<anahtar>`a bakıyor, yoksa varsayılana düşüyor — blok eklenince kod değişmeden oradan
+  okunur (Faz 4'ün `dashboard:` bloğu deseninin aynısı). Aynı şey `dashboard.py`'deki
+  `LLM_PANEL_ROWS / MICRO_WINDOW_MIN / EQUITY_MAX_POINTS` için de geçerli.
+- **`judge.py` düzeltmesi canlıda DEĞİL** — Faz 7 restart'ı bekliyor (yukarıdaki uyarı kutusu).
+- Sohbet geçmişi **sayfada** tutuluyor; yenilenince sıfırlanır (spec bunu istiyordu). Sunucu
+  tarafında oturum yok.
+- `POST /ask` kimlik doğrulaması **yok** — `/control` ile aynı sınır. `--host 0.0.0.0` ile LAN'a
+  açmak ağdaki herkese sohbet (ve dolaylı olarak API bütçesi) erişimi verir. 127.0.0.1'de kalmalı.
+- Alt şeritteki **"kullanılan ATK araçları sayacı"** (spec §4) yapılmadı — `ask.jsonl` ve
+  `llm.jsonl` veriyi taşıyor, sayaç kartı Faz 8'e.
+- Prompt'lar İngilizce, çıktı Türkçe (Faz 5 ile aynı gerekçe).
+
+### Dashboard yeniden başlatma
+```bash
+cd /Users/osmancanbozali/Desktop/terazi
+pkill -f "uvicorn dashboard:app"
+nohup .venv/bin/uvicorn dashboard:app --port 8787 > logs/dashboard.out 2>&1 & disown
+```
+
 ## Faz 5 — judge.py (LLM katmanı) + ertelenmiş düzeltmeler: TAMAM (12 Eylül, 14:20 +03:00)
 
 **Teslimat:** `judge.py` (yeni), `tools.py` +6 metot, `terazi.py` 9 dokunuş, `dashboard.py`,
@@ -290,8 +437,9 @@ uygulanmadı — yarışma tek gün olduğu için bugün etkisi yok. Ajan gece y
 gün başı equity dünden kalır.
 
 ## Şu anki faz
-**Faz 4 — Dashboard MVP: TAMAM** (12 Eylül 2026, 13:20 +03:00). Sıradaki: **Faz 5 — `judge.py`**
-(yargıç + rejim yorumcusu, `llm.jsonl`).
+**Faz 6 — "Ajana sor" + LLM paneli + equity + sparkline: TAMAM** (12 Eylül 2026, 15:05 +03:00).
+Sıradaki: **Faz 7 — güvenilirlik** (MCP→CLI yedeği, çökme kurtarma, gün sonu kapanışı demoda).
+Faz 7'deki tek yeniden başlatma `judge.py` not düzeltmesini de canlıya taşıyacak.
 
 **Faz 2 — `terazi.py` + `tools.py` MVP: TAMAM** (12 Eylül 2026, 09:07 UTC).
 Demo'da bir emir uçtan uca geçti: giriş → dolum → `algoId` yakalama → kurtarma → kapatma.
