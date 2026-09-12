@@ -139,3 +139,16 @@ demo_test:
   target_bps: 100              # TP = giriş × (1 + bu/10000)
   stop_bps: 100                # SL; 50–120 bandı içinde olmalı
   notional_usdt: 12            # demo bakiyesinin %30'u yerine küçük emir
+
+# CANLI emir yolu donuk/kırık mı diye tek atımlık uçtan uca test (Faz 8). Yalnızca
+# `--smoke-test` CLI bayrağı VE enabled:true BİRLİKTE iken çalışır (terazi.py smoke_test());
+# çalıştıktan sonra (başarılı/başarısız fark etmez) enabled kendi kendine false'a döner.
+# Risk kapısı ATLANMAZ (_risk_gate smoke_active dalı) — kill switch/pause/cooldown/bakiye
+# kontrolleri normal işlem gibi uygulanır. closed_positions/daily_trades/kill_switch'e YAZMAZ;
+# sonuç yalnızca state.smoke_test'te, decisions.jsonl'e action:"SMOKE_TEST_*" ve
+# excluded_from_performance:true ile loglanır.
+smoke_test:
+  enabled: false
+  symbol: BTC-USDT
+  notional_usdt: 2.0
+  hold_sec: 60

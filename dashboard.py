@@ -138,6 +138,25 @@ def read_jsonl_tail(path: Path, n: int | None = None) -> tuple[list[dict[str, An
     return rows, skipped
 
 
+def read_jsonl_history(path: Path, n: int | None = None) -> tuple[list[dict[str, Any]], int]:
+    """Aktif logu ve profil değişimlerinde taşınan arşivlerini birlikte oku."""
+    paths = [path]
+    if path.parent == LOGS:
+        paths.extend(sorted(LOGS.glob(f"archive/*/{path.name}")))
+
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for source in paths:
+        source_rows, source_skipped = read_jsonl_tail(source)
+        rows.extend(source_rows)
+        skipped += source_skipped
+
+    rows.sort(key=lambda row: str(row.get("ts", "")))
+    if n is not None:
+        rows = rows[-n:]
+    return rows, skipped
+
+
 def read_json(path: Path) -> dict[str, Any]:
     """state.json / control.json. Yoksa veya yarım yazılmışsa boş sözlük + konsol notu."""
     if not path.exists():
@@ -199,6 +218,8 @@ def count_today(rows: list[dict[str, Any]], today: str) -> dict[str, int]:
     for r in rows:
         if not str(r.get("ts", "")).startswith(today):
             continue
+        if r.get("excluded_from_performance"):
+            continue  # --smoke-test satırları (SMOKE_TEST_*): işlem sayaçlarına GİRMEZ
         counts["total"] += 1
         action = str(r.get("action", ""))
         if action.startswith("OPERATOR_"):
@@ -335,7 +356,7 @@ def index() -> FileResponse:
 def get_state() -> dict[str, Any]:
     state = read_json(STATE)
     control = read_json(CONTROL)
-    rows, skipped = read_jsonl_tail(DECISIONS)
+    rows, skipped = read_jsonl_history(DECISIONS)
 
     last_turn_ms = state.get("last_turn_ms") or 0
     if not last_turn_ms and STATE.exists():
@@ -383,13 +404,13 @@ def get_state() -> dict[str, Any]:
 @app.get("/feed")
 def get_feed(n: int = 50) -> dict[str, Any]:
     n = max(1, min(n, 500))
-    rows, skipped = read_jsonl_tail(DECISIONS, n)
+    rows, skipped = read_jsonl_history(DECISIONS, n)
     return {"rows": list(reversed(rows)), "skipped": skipped, "count": len(rows)}
 
 
 @app.get("/orders")
 def get_orders() -> dict[str, Any]:
-    rows, skipped = read_jsonl_tail(ORDERS)
+    rows, skipped = read_jsonl_history(ORDERS)
     return {"rows": [order_summary(r) for r in reversed(rows)], "skipped": skipped, "count": len(rows)}
 
 
@@ -398,7 +419,7 @@ def get_llm(n: int = LLM_PANEL_ROWS) -> dict[str, Any]:
     """LLM paneli: `llm.jsonl` son n satırı, EN YENİ ÖNCE. `attempts` ve `input_summary` kırpılır —
     panel verdict/view, status ve gecikmeyi gösteriyor, ham girdi özetini göstermiyor."""
     n = max(1, min(n, 50))
-    rows, skipped = read_jsonl_tail(LLM_LOG, n)
+    rows, skipped = read_jsonl_history(LLM_LOG, n)
     return {"rows": [llm_summary(r) for r in reversed(rows)], "skipped": skipped,
             "count": len(rows)}
 
@@ -407,7 +428,7 @@ def get_llm(n: int = LLM_PANEL_ROWS) -> dict[str, Any]:
 def get_equity() -> dict[str, Any]:
     """Equity eğrisi. Kaynak `decisions.jsonl`: her satırda `equity` var (string!). Ardışık aynı
     değerler seyreltilir — 30 USDT'lik hesapta yüzlerce satır aynı sayıyı taşıyor."""
-    rows, skipped = read_jsonl_tail(DECISIONS)
+    rows, skipped = read_jsonl_history(DECISIONS)
     state = read_json(STATE)
 
     points: list[dict[str, Any]] = []
@@ -416,7 +437,7 @@ def get_equity() -> dict[str, Any]:
     for r in rows:
         val = to_float(r.get("equity"))
         ts = r.get("ts")
-        if val is None or not ts:
+        if val is None or val <= 0 or not ts:
             continue
         point = {"ts": ts, "equity": val}
         if last is None or val != last:
@@ -447,7 +468,7 @@ def get_micro(minutes: int = MICRO_WINDOW_MIN) -> dict[str, Any]:
     """Mikro sparkline'lar: `micro.jsonl`'in son `minutes` dakikası, parite başına OBI ve
     spread_bps serisi (strateji.md §4.3 — bu katman 20 sn'de bir örnekliyor)."""
     minutes = max(1, min(minutes, 240))
-    rows, skipped = read_jsonl_tail(MICRO)
+    rows, skipped = read_jsonl_history(MICRO)
     cutoff = datetime.now(tz=CFG["tz"]).timestamp() - minutes * 60
 
     series: dict[str, dict[str, list[Any]]] = {}

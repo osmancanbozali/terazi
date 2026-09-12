@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import statistics
 import sys
 import traceback
@@ -376,6 +377,9 @@ class State:
     regime_commentary: dict[str, Any] | None = None  # LLM rejim yorumu (30 dk)
     # Kapanan işlemler, en yeni SONDA; komisyonlu net PnL ile (Faz 7). Dashboard kartı buradan okur.
     closed_positions: list[dict[str, Any]] = field(default_factory=list)
+    # `--smoke-test` sonucu, TEK kayıt (en son çalışma). closed_positions/daily_trades/kill_switch
+    # bundan HİÇ etkilenmez — dashboard gri "TEST" rozeti buradan okur, sayaçlardan ayrı.
+    smoke_test: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -401,6 +405,7 @@ class State:
             "vol_ban_until_ms": self.vol_ban_until_ms,
             "regime_commentary": self.regime_commentary,
             "closed_positions": self.closed_positions,
+            "smoke_test": self.smoke_test,
         }
 
     @classmethod
@@ -428,6 +433,7 @@ class State:
             vol_ban_until_ms=int(d.get("vol_ban_until_ms") or 0),
             regime_commentary=d.get("regime_commentary"),
             closed_positions=list(d.get("closed_positions") or []),
+            smoke_test=d.get("smoke_test"),
         )
         dse = d.get("day_start_equity")
         st.day_start_equity = Decimal(dse) if dse else None
@@ -480,6 +486,29 @@ def archive_if_profile_changed(profile: str, demo: bool | None) -> dict[str, Any
         "log_archive": str(log_archive) if moved else None,
         "logs_moved": moved,
     }
+
+
+def disable_smoke_test_config(config_path: str) -> None:
+    """`smoke_test.enabled: true` → `false`, TEK SATIR metin değişikliği.
+
+    `yaml.safe_dump` KULLANILMAZ: config.yaml'ın açıklama yorumları (CLAUDE.md kuralı belgeleri)
+    baştan yazımda silinirdi. Yalnızca `smoke_test:` bloğu içindeki `enabled:` satırı değişir.
+    """
+    lines = Path(config_path).read_text(encoding="utf-8").splitlines(keepends=True)
+    in_block = False
+    for i, line in enumerate(lines):
+        stripped = line.rstrip("\n")
+        if re.match(r"^smoke_test:\s*$", stripped):
+            in_block = True
+            continue
+        if in_block:
+            if stripped and not stripped[0].isspace():
+                break  # blok bitti, üst seviyeye dönüldü
+            m = re.match(r"^(\s*enabled:\s*)true\b(.*)$", stripped)
+            if m:
+                lines[i] = f"{m.group(1)}false{m.group(2)}\n"
+                break
+    Path(config_path).write_text("".join(lines), encoding="utf-8")
 
 
 def read_control() -> dict[str, Any]:
@@ -1302,8 +1331,14 @@ class Agent:
             return False, "risk_per_pair", f"{pair}'de zaten pozisyon/emir var", zero, zero
         # 6 boyut
         dt = self.cfg.demo_test
+        st = self.cfg.smoke_test
+        # `st` yalnızca --smoke-test bayrağıYLA BİRLİKTE etkili: config'de enabled kalıp
+        # unutulsa bile normal sinyal akışı (bayraksız) bu paritede gerçek boyutlamayı kullanır.
+        smoke_active = bool(st.enabled) and bool(getattr(self.args, "smoke_test", False)) and pair == st.symbol
         if dt.enabled and pair == dt.pair:
             notional = Decimal(str(dt.notional_usdt))
+        elif smoke_active:
+            notional = Decimal(str(st.notional_usdt))
         else:
             notional = self.state.equity * Decimal(str(r.position_pct))
         notional *= Decimal(str(min(1.0, max(0.0, size_mult))))  # LLM REDUCE: sadece küçültür
@@ -1319,6 +1354,8 @@ class Agent:
         if bid is None or ask is None:
             return False, "risk_instrument", "en iyi alış/satış yok (defter örneği eksik)", zero, zero
         if dt.enabled and pair == dt.pair and dt.entry_px == "ask":
+            px = q_px(Decimal(str(ask)), spec["tickSz"])
+        elif smoke_active:
             px = q_px(Decimal(str(ask)), spec["tickSz"])
         else:
             px = q_px(Decimal(str(bid)) + spec["tickSz"], spec["tickSz"])
@@ -1773,6 +1810,205 @@ class Agent:
             cancelled += 1
         return closed, cancelled
 
+    # ---- smoke test (tek atımlık emir yolu doğrulaması) ----
+
+    def smoke_decide(self, action: str, **fields: Any) -> None:
+        """decisions.jsonl'e SMOKE_TEST_* satırı. `excluded_from_performance` HER satırda —
+        dashboard sayaçları (count_today) bunu filtreler, closed_positions/daily_trades/
+        kill_switch bu akıştan hiç yazılmaz."""
+        self.decide(f"SMOKE_TEST_{action}", excluded_from_performance=True, **fields)
+
+    async def smoke_test(self) -> int:
+        """`--smoke-test` + config `smoke_test.enabled: true`: emir yolunun CANLI hâlde donuk/
+        kırık olmadığını doğrulayan tek atımlık test. Ana turdan (tick/run) tamamen ayrı,
+        SetupTracker/sinyal/mikro-teyit/maliyet-kapısı/yargıç YOK — yalnızca gerçek emir kod
+        yolu: tools.place_order, risk kapısı ATLANMAZ (bkz. `_risk_gate` `smoke_active` dalı).
+
+        closed_positions/daily_pnl/kill_switch/daily_trades'e HİÇ YAZMAZ; sonuç yalnızca
+        `state.smoke_test`'e gider. Başarılı/başarısız fark etmeksizin config'deki
+        `smoke_test.enabled` bu çalışmanın SONUNDA false'a çekilir (tek atımlık).
+        """
+        st = self.cfg.smoke_test
+        if not st.enabled:
+            raise SystemExit(
+                "--smoke-test verildi ama config.yaml smoke_test.enabled=false. "
+                "Yalnızca CLI bayrağı VE enabled:true birlikteyken çalışır; config'i açıp tekrar deneyin."
+            )
+        pair = str(st.symbol)
+        print(f"SMOKE TEST başlıyor: {pair} · notional={st.notional_usdt} USDT · "
+              f"hold_sec={st.hold_sec} · profil={self.t.profile} demo={self.t.demo}")
+
+        fee = await self.t.get_trade_fee("SPOT")
+        self.fee_bps = float(abs(Decimal(str(fee["maker"])))) * 10_000
+        self.state = State.load()
+        self.state.profile = self.t.profile
+        self.state.demo = self.t.demo
+        ctl = read_control()
+        self.state.risk_level = self._resolve_risk_level(ctl["risk_level"])
+        await self.refresh_equity()
+
+        specs = await self.t.get_instruments("SPOT", inst_id=pair)
+        if not specs:
+            raise SystemExit(f"smoke_test.symbol={pair} market_get_instruments'ta yok.")
+        row = specs[0]
+        self.inst[pair] = {"tickSz": Decimal(str(row["tickSz"])), "lotSz": Decimal(str(row["lotSz"])),
+                           "minSz": Decimal(str(row["minSz"]))}
+        if pair not in self.spreads:
+            self.spreads[pair] = SpreadWindow(self.cfg.micro.spread_median_window_sec)
+        await self.sample_pair(pair)
+
+        orders_allowed = ctl["mode"] == "run"
+        stop_bps = float(self.cfg.risk.min_stop_bps)  # bandın alt sınırı — yeni eşik EKLENMEDİ
+        self.smoke_decide("START", symbol=pair, reason=f"tek atımlık emir yolu testi, "
+                          f"notional={st.notional_usdt} USDT, hold_sec={st.hold_sec}")
+
+        allowed, gate, reason, sz, px = await self._risk_gate(pair, stop_bps, orders_allowed)
+        if not allowed:
+            self.smoke_decide("REJECT", symbol=pair, gate=gate, reason=reason)
+            self._finish_smoke_test({"ok": False, "stage": "risk_gate", "gate": gate, "reason": reason})
+            return 1
+
+        spec = self.inst[pair]
+        target = px * (Decimal(1) + Decimal(str(stop_bps)) / Decimal(10_000))
+        stop = px * (Decimal(1) - Decimal(str(stop_bps)) / Decimal(10_000))
+        tp = q_px(target, spec["tickSz"])
+        sl = q_px(stop, spec["tickSz"])
+        sl_ord = q_px(sl - 2 * spec["tickSz"], spec["tickSz"])
+        cl_ord_id = f"terazismoke{now_ms() % 10_000_000_000}"
+        req = {"instId": pair, "side": "buy", "ordType": "limit", "tdMode": "cash",
+               "px": dstr(px), "sz": dstr(sz), "clOrdId": cl_ord_id,
+               "tpTriggerPx": dstr(tp), "tpOrdPx": dstr(tp),
+               "slTriggerPx": dstr(sl), "slOrdPx": dstr(sl_ord)}
+        try:
+            res = await self.t.place_order(
+                inst_id=pair, side="buy", ord_type="limit", sz=dstr(sz), px=dstr(px),
+                td_mode="cash", cl_ord_id=cl_ord_id,
+                tp_trigger_px=dstr(tp), tp_ord_px=dstr(tp),
+                sl_trigger_px=dstr(sl), sl_ord_px=dstr(sl_ord),
+            )
+        except (SafetyGateError, OkxToolError) as exc:
+            detail = getattr(exc, "detail", str(exc))
+            self.order_log(symbol=pair, action="smoke_test_buy", request=req, ok=False, error=str(detail))
+            self.smoke_decide("ERROR", symbol=pair, gate="order", reason=f"alış reddedildi: {detail}")
+            self._finish_smoke_test({"ok": False, "stage": "buy", "error": str(detail)})
+            return 1
+
+        if res.get("dry_run"):
+            self.order_log(symbol=pair, action="smoke_test_buy", request=req, dry_run=True, ok=True)
+            self.smoke_decide("ORDER", symbol=pair, dry_run=True, reason="dry-run: emir gönderilmedi",
+                              px=dstr(px), sz=dstr(sz), tp=dstr(tp), sl=dstr(sl))
+            self._finish_smoke_test({"ok": True, "stage": "buy", "dry_run": True})
+            return 0
+
+        ord_id = str(res.get("ordId", ""))
+        self.order_log(symbol=pair, action="smoke_test_buy", request=req, ok=True, response=res, ord_id=ord_id)
+        self.smoke_decide("ORDER", symbol=pair, ord_id=ord_id, px=dstr(px), sz=dstr(sz),
+                          tp=dstr(tp), sl=dstr(sl),
+                          reason=f"limit alış {dstr(px)} × {dstr(sz)}, TP {dstr(tp)} / SL {dstr(sl)}")
+        print(f"SMOKE ORDER {pair} ordId={ord_id} px={dstr(px)} sz={dstr(sz)}, "
+              f"{st.hold_sec} sn dolum/tutma bekleniyor...")
+
+        await asyncio.sleep(float(st.hold_sec))
+
+        try:
+            od = await self.t.get_order(pair, ord_id=ord_id)
+        except OkxToolError as exc:
+            self.smoke_decide("ERROR", symbol=pair, gate="reconcile",
+                              reason=f"emir sorgusu başarısız: {exc.detail}")
+            self._finish_smoke_test({"ok": False, "stage": "poll", "error": str(exc.detail)})
+            return 1
+        filled = Decimal(str(od.get("accFillSz") or 0))
+        if filled <= 0:
+            try:
+                await self.t.cancel_order(pair, ord_id=ord_id)
+                self.order_log(symbol=pair, action="smoke_test_cancel", ord_id=ord_id, ok=True,
+                               reason=f"{st.hold_sec} sn'de dolmadı")
+            except OkxToolError as exc:
+                self.order_log(symbol=pair, action="smoke_test_cancel", ord_id=ord_id, ok=False,
+                               error=str(exc.detail))
+            self.smoke_decide("UNFILLED", symbol=pair, ord_id=ord_id,
+                              reason=f"{st.hold_sec} sn içinde dolmadı, emir iptal edildi")
+            print(f"SMOKE TEST: {pair} {st.hold_sec} sn'de dolmadı, iptal edildi.")
+            self._finish_smoke_test({"ok": False, "stage": "fill", "reason": "dolmadı"})
+            return 1
+
+        real_sz, avg_px, entry_fee = await self._fill_summary(pair, ord_id)
+        if real_sz <= 0:
+            real_sz, avg_px = filled, Decimal(str(od.get("avgPx") or px))
+        algo_id = await self._find_algo_id(pair)
+        self.smoke_decide("FILL", symbol=pair, price=float(avg_px), sz=dstr(real_sz),
+                          algo_id=algo_id, ord_id=ord_id, fee_paid=float(entry_fee),
+                          reason=f"dolum {dstr(real_sz)} @ {dstr(avg_px)}; algoId={algo_id or 'YOK'}")
+
+        if algo_id:
+            try:
+                await self.t.cancel_algo_order(pair, algo_id)
+                self.order_log(symbol=pair, action="smoke_test_cancel_algo", algo_id=algo_id, ok=True)
+                self.smoke_decide("CANCEL_ALGO", symbol=pair, algo_id=algo_id, reason="TP/SL iptal edildi")
+            except OkxToolError as exc:
+                self.order_log(symbol=pair, action="smoke_test_cancel_algo", algo_id=algo_id,
+                               ok=False, error=str(exc.detail))
+                self.smoke_decide("ERROR", symbol=pair, gate="exit",
+                                  reason=f"algo iptal edilemedi: {exc.detail}")
+                self._finish_smoke_test({"ok": False, "stage": "cancel_algo", "error": str(exc.detail)})
+                return 1
+        else:
+            self.smoke_decide("ERROR", symbol=pair, gate="exit",
+                              reason="algoId bulunamadı (TP/SL iliştirilmemiş olabilir), yine de satılıyor")
+
+        base_ccy = pair.split("-")[0]
+        try:
+            avail_base = await self.t.get_avail_bal(base_ccy)
+        except OkxToolError:
+            avail_base = real_sz
+        sell_sz = q_sz(min(real_sz, avail_base) if avail_base > 0 else real_sz, spec["lotSz"])
+        sell_req = {"instId": pair, "side": "sell", "ordType": "market", "sz": dstr(sell_sz),
+                    "tgtCcy": "base_ccy"}
+        try:
+            sell_res = await self.t.place_order(inst_id=pair, side="sell", ord_type="market",
+                                                sz=dstr(sell_sz), td_mode="cash", tgt_ccy="base_ccy")
+        except (OkxToolError, SafetyGateError) as exc:
+            detail = getattr(exc, "detail", str(exc))
+            self.order_log(symbol=pair, action="smoke_test_sell", request=sell_req, ok=False, error=str(detail))
+            self.smoke_decide("ERROR", symbol=pair, gate="exit", reason=f"kapatma başarısız: {detail}")
+            self._finish_smoke_test({"ok": False, "stage": "sell", "error": str(detail)})
+            return 1
+
+        pos = Position(pair=pair, ord_id=ord_id, cl_ord_id=cl_ord_id, entry_px=avg_px, sz=real_sz,
+                       target=tp, stop=sl, opened_ms=now_ms(), algo_id=algo_id, fee_paid=entry_fee)
+        if sell_res.get("dry_run"):
+            self.order_log(symbol=pair, action="smoke_test_sell", request=sell_req, dry_run=True, ok=True)
+            self.smoke_decide("EXIT", symbol=pair, dry_run=True, reason="dry-run: satış gönderilmedi")
+            self._finish_smoke_test({"ok": True, "stage": "sell", "dry_run": True})
+            return 0
+
+        sell_ord_id = str(sell_res.get("ordId", ""))
+        self.order_log(symbol=pair, action="smoke_test_sell", request=sell_req, ok=True,
+                       response=sell_res, ord_id=sell_ord_id)
+        exit_sz, exit_px, exit_fee = await self._fill_summary(pair, sell_ord_id)
+        if not exit_px:
+            bid = self.micro_last.get(pair, {}).get("best_bid")
+            if bid:
+                exit_px = Decimal(str(bid))
+        if exit_fee == 0 and exit_px:
+            exit_fee = exit_px * (exit_sz or sell_sz) * Decimal(str(self.fee_bps)) / Decimal(10_000)
+        pnl = self._pnl(pos, exit_px, exit_fee)
+        self.smoke_decide("EXIT", symbol=pair, sz=dstr(exit_sz or sell_sz),
+                          price=float(exit_px) if exit_px else None, ord_id=sell_ord_id, **pnl)
+        print(f"SMOKE EXIT {pair} {dstr(exit_sz or sell_sz)} @ {dstr(exit_px)} "
+              f"net={pnl['net_bps']}bps net_pnl={pnl['net_pnl_usdt']} USDT")
+        self._finish_smoke_test({"ok": True, "stage": "done", "pair": pair,
+                                 "entry_px": str(avg_px), "exit_px": None if exit_px is None else str(exit_px),
+                                 "sz": str(real_sz), **pnl})
+        return 0
+
+    def _finish_smoke_test(self, result: dict[str, Any]) -> None:
+        """Sonucu state.smoke_test'e yaz (sayaçlara GİRMEZ) ve config'i kendi kendine kapat."""
+        self.state.smoke_test = {"ts": datetime.now(tz=self.tz).isoformat(timespec="seconds"), **result}
+        self.state.save()
+        disable_smoke_test_config(self.args.config)
+        print(f"SMOKE TEST bitti (sonuç state.smoke_test'e yazıldı): {result}")
+
     # ---- tur ----
 
     async def tick(self) -> None:
@@ -1931,6 +2167,9 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true", help="emir gönderilmez, loglanır")
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--max-turns", type=int, default=0, help="0 = sonsuz")
+    p.add_argument("--smoke-test", action="store_true",
+                    help="tek atımlık emir yolu testi; config smoke_test.enabled=true de şart, "
+                         "ikisi birlikte olmadan çalışmaz")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -1951,7 +2190,10 @@ def main() -> int:
                             expected_demo=args.expected_demo, dry_run=args.dry_run,
                             cli_fallback=bool(cfg.execution.cli_fallback),
                             cli_timeout_sec=float(cfg.execution.cli_timeout_sec)) as t:
-            return await Agent(cfg, t, args).run()
+            agent = Agent(cfg, t, args)
+            if args.smoke_test:
+                return await agent.smoke_test()
+            return await agent.run()
 
     return asyncio.run(go())
 

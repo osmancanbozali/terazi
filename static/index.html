@@ -144,6 +144,7 @@
     <div class="ml-2 flex items-center gap-2.5">
       <span id="mode-badge" class="px-3 py-1.5 rounded-full font-bold text-[13px] mono">…</span>
       <span id="flatten-badge" class="hidden px-3 py-1.5 rounded-full font-bold text-[13px] mono bg-[rgba(240,180,60,.14)] text-[#f3c265] border border-[rgba(240,180,60,.3)]">flatten=true</span>
+      <span id="smoke-badge" class="hidden px-3 py-1.5 rounded-full font-bold text-[13px] mono bg-[rgba(255,255,255,.06)] text-[#9aa0a8] border border-[rgba(255,255,255,.14)]" title="">TEST</span>
     </div>
     <div class="flex items-center gap-2.5">
       <span class="text-[13px] text-[#7d838c] mono">risk seviyesi</span>
@@ -500,7 +501,7 @@ function renderEquity(data) {
                               callbacks: { label: c => `${c.dataset.label}: ${Number(c.parsed.y).toFixed(4)} USDT` } } },
         scales: {
           // gün başı tabanı 29,99 civarında; sıfırdan başlayan eksen çizgiyi düz gösterir.
-          y: { beginAtZero: false, grid: { color: GRID }, ticks: { color: TICK, font: { size: 10, family: "'JetBrains Mono', monospace" }, maxTicksLimit: 4 } },
+          y: { beginAtZero: false, grace: "20%", grid: { color: GRID }, ticks: { color: TICK, font: { size: 10, family: "'JetBrains Mono', monospace" }, maxTicksLimit: 4 } },
           x: { grid: { display: false }, ticks: { color: TICK, font: { size: 10, family: "'JetBrains Mono', monospace" }, maxTicksLimit: 6, autoSkip: true } },
         },
       },
@@ -742,6 +743,15 @@ function renderControl(s) {
     mode === "pause" ? "bg-[rgba(240,180,60,.14)] text-[#f3c265] border-[rgba(240,180,60,.3)]" :
                        "bg-[rgba(224,55,74,.14)] text-[#ff8a95] border-[rgba(224,55,74,.3)]");
   $("flatten-badge").classList.toggle("hidden", !(s.control || {}).flatten);
+
+  const smoke = (s.state || {}).smoke_test;
+  const smokeBadge = $("smoke-badge");
+  smokeBadge.classList.toggle("hidden", !smoke);
+  if (smoke) {
+    const bits = [smoke.ok ? "ok" : "başarısız", smoke.pair, smoke.net_bps != null ? `${smoke.net_bps}bps` : null,
+                  smoke.ts].filter(Boolean);
+    smokeBadge.title = `son smoke test — sayaçlara girmez: ${bits.join(" · ")}`;
+  }
 
   const btn = $("btn-toggle");
   if (mode === "pause") {
