@@ -51,6 +51,12 @@ CONTROL = Path("control.json")
 
 TRANSPORT = "mcp"  # başlangıç aktarımı; Faz 7'den beri çalışma anında değişir (CLI yedeği)
 
+# Risk seviyesine bağlı OLAN tek küme (Faz 7.5). Bu listenin dışındaki her risk sayısı
+# `config.yaml` `risk:` bloğunda, seviyeden bağımsız, tek yerde yaşar. Liste burada sabit
+# çünkü eşik değil KAPSAM: hangi parametrenin operatöre açıldığını söylüyor.
+LEVEL_KEYS = ("position_pct", "max_concurrent", "max_daily_trades",
+              "kill_switch_daily_pct", "cooldown_sec")
+
 
 # ----------------------------------------------------------------------------
 # Yapılandırma — config.yaml tek sayısal gerçek kaynağı
@@ -363,6 +369,9 @@ class State:
     last_signal_bar_ts: int = 0
     trade_day: str = ""
     transport: str = TRANSPORT
+    risk_level: str = ""  # aktif operatör risk seviyesi (Faz 7.5); otoritesi control.json
+    turn_requests: int = 0  # son turda borsaya giden istek sayısı (Faz 7.5 bütçe ölçümü)
+    turn_ms: int = 0  # son turun süresi
     vol_ban_until_ms: int = 0  # dashboard sarı rozeti buradan okur (Faz 5)
     regime_commentary: dict[str, Any] | None = None  # LLM rejim yorumu (30 dk)
     # Kapanan işlemler, en yeni SONDA; komisyonlu net PnL ile (Faz 7). Dashboard kartı buradan okur.
@@ -386,6 +395,9 @@ class State:
             "last_signal_bar_ts": self.last_signal_bar_ts,
             "trade_day": self.trade_day,
             "transport": self.transport,
+            "risk_level": self.risk_level,
+            "turn_requests": self.turn_requests,
+            "turn_ms": self.turn_ms,
             "vol_ban_until_ms": self.vol_ban_until_ms,
             "regime_commentary": self.regime_commentary,
             "closed_positions": self.closed_positions,
@@ -410,6 +422,9 @@ class State:
             last_turn_ms=d.get("last_turn_ms", 0),
             last_signal_bar_ts=d.get("last_signal_bar_ts", 0),
             trade_day=d.get("trade_day", ""),
+            # risk_level GERİ OKUNUR: yazılıp okunmayan alan (transport, last_tick_ts) hatası
+            # tekrarlanmıyor — control.json boşsa yeniden başlatmada seviye buradan gelir.
+            risk_level=d.get("risk_level") or "",
             vol_ban_until_ms=int(d.get("vol_ban_until_ms") or 0),
             regime_commentary=d.get("regime_commentary"),
             closed_positions=list(d.get("closed_positions") or []),
@@ -468,16 +483,25 @@ def archive_if_profile_changed(profile: str, demo: bool | None) -> dict[str, Any
 
 
 def read_control() -> dict[str, Any]:
-    """control.json'u oku; yoksa varsayılanla oluştur (dashboard henüz yazmıyorsa)."""
-    default = {"mode": "run", "flatten": False}
+    """control.json'u oku; yoksa varsayılanla oluştur (dashboard henüz yazmıyorsa).
+
+    `risk_level` None olabilir: operatör hiç seçmemiş demektir, çözüm ajanda
+    (control.json → state.json → config varsayılanı).
+    """
+    default: dict[str, Any] = {"mode": "run", "flatten": False, "risk_level": None}
     if not CONTROL.exists():
-        CONTROL.write_text(json.dumps(default, indent=2), encoding="utf-8")
+        CONTROL.write_text(json.dumps({"mode": "run", "flatten": False}, indent=2), encoding="utf-8")
         return default
     try:
         data = json.loads(CONTROL.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return default  # dashboard yarı yazmış olabilir; bu turu varsayılanla geç
-    return {"mode": data.get("mode", "run"), "flatten": bool(data.get("flatten", False))}
+    level = data.get("risk_level")
+    return {
+        "mode": data.get("mode", "run"),
+        "flatten": bool(data.get("flatten", False)),
+        "risk_level": str(level) if level else None,
+    }
 
 
 def write_control(patch: dict[str, Any]) -> dict[str, Any]:
@@ -485,9 +509,14 @@ def write_control(patch: dict[str, Any]) -> dict[str, Any]:
 
     Ajan yalnızca iki durumda yazar: açılışta mode=kill'i tüketirken ve flatten yürütüldükten sonra
     bayrağı düşürürken. Operatör komutu vermez; verilen komutu tüketir.
+
+    Birleştirme operatörün `risk_level` seçimini TAŞIR: beyaz liste iki anahtarda kalsaydı
+    ajanın flatten sonrası yazışı seviyeyi sessizce silerdi (dashboard.write_control aynı).
     """
     cur = read_control()
-    merged = {"mode": cur["mode"], "flatten": cur["flatten"]}
+    merged: dict[str, Any] = {"mode": cur["mode"], "flatten": cur["flatten"]}
+    if cur["risk_level"]:
+        merged["risk_level"] = cur["risk_level"]
     merged.update(patch)
     tmp = CONTROL.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -521,6 +550,50 @@ class Agent:
         self._h1_bars: list[dict[str, Any]] = []  # rejim yorumcusu için son 1H mumlar
         self._last_mode = "run"
         self._last_flatten = False
+        self._last_risk_level = ""
+        self.last_universe_ms = 0
+        self.micro_subsets = 1  # alt küme sayısı; `_apply_universe` hesaplar
+        self._filter_last: dict[str, Any] = {}  # market_filter satırındaki `last` (istek tasarrufu)
+
+    # ---- risk seviyesi (Faz 7.5) ----
+
+    @property
+    def risk_level(self) -> str:
+        return self.state.risk_level or str(self.cfg.risk_levels["default"])
+
+    def risk_params(self) -> Cfg:
+        """`risk:` bloğu + aktif seviyenin BEŞ anahtarı. Emre giden her sayı buradan okunur.
+
+        Seviyeye bağlı olan tek küme `LEVEL_KEYS`; strateji eşikleri (`stop_atr_mult`,
+        `min_stop_bps`, `max_stop_bps`, `cooldown_losses`) `risk:` bloğunda tek yerde kalır.
+        Tanınmayan seviye buraya HİÇ gelmez (`_resolve_risk_level` süzüyor), ama gelirse
+        `risk:` bloğu geçerli olur — fren tarafı, gevşeme değil.
+        """
+        merged = dict(self.cfg.risk)
+        level = self.cfg.risk_levels.get(self.risk_level)
+        if isinstance(level, dict):
+            for key in LEVEL_KEYS:
+                if key in level:
+                    merged[key] = level[key]
+        return Cfg(merged)
+
+    def _resolve_risk_level(self, from_control: str | None) -> str:
+        """control.json → state.json → config varsayılanı. Tanınmayan değer ajanı ÇÖKERTMEZ."""
+        default = str(self.cfg.risk_levels["default"])
+        for candidate, source in ((from_control, "control.json"), (self.state.risk_level, "state.json")):
+            if not candidate:
+                continue
+            if candidate in self.cfg.risk_levels and candidate != "default":
+                return candidate
+            self.decide("ERROR", gate="risk_level",
+                        reason=f"{source}'da tanınmayan risk_level={candidate!r}; "
+                               f"geçerli: {self._level_names()}")
+            print(f"UYARI: tanınmayan risk_level={candidate!r} ({source}) — yok sayıldı",
+                  file=sys.stderr)
+        return default
+
+    def _level_names(self) -> list[str]:
+        return [k for k in self.cfg.risk_levels if k != "default"]
 
     # ---- kayıt yardımcıları ----
 
@@ -545,6 +618,13 @@ class Agent:
     # ---- açılış ----
 
     async def startup(self) -> None:
+        # Bar tipografisi: `BAR_MS[bar]` tanınmayan barda ÇIPLAK KeyError atıyordu ("1h" gibi
+        # bir yazım hatası ajanı anlaşılmaz biçimde düşürürdü). Eşik değil, guard.
+        for key, bar in (("signal.bar", self.cfg.signal.bar), ("regime.bar", self.cfg.regime.bar)):
+            if bar not in BAR_MS:
+                raise SystemExit(f"config.yaml {key}={bar!r} tanınmıyor; "
+                                 f"geçerli barlar: {', '.join(BAR_MS)}")
+
         caps_demo = None
         fee = await self.t.get_trade_fee("SPOT")
         caps_demo = self.t.demo
@@ -590,25 +670,23 @@ class Agent:
                 logs_moved=archived["logs_moved"],
             )
 
+        # Risk seviyesi evren doğrulamasından ÖNCE çözülür: minSz taraması seviyenin
+        # notional'ıyla yapılır (cautious %20 ile geçmeyen parite aggressive %40 ile geçer).
+        ctl_level = read_control()["risk_level"]
+        self.state.risk_level = self._resolve_risk_level(ctl_level)
+        self._last_risk_level = self.state.risk_level
+        rp = self.risk_params()
+        print(f"risk seviyesi = {self.state.risk_level} "
+              f"(kaynak: {'control.json' if ctl_level else 'state/config varsayılanı'}) · "
+              f"boyut %{float(rp.position_pct) * 100:g} · eşzamanlı {rp.max_concurrent} · "
+              f"günlük tavan {rp.max_daily_trades} · kill {rp.kill_switch_daily_pct}% · "
+              f"cooldown {int(rp.cooldown_sec) // 60} dk")
+
         # Evren doğrulaması gerçek boyutla çalışsın diye equity ÖNCE okunur.
+        # Takipçiler ve spread pencereleri `_apply_universe` içinde kurulur (saat başı
+        # yenilemede de aynı yol çalışsın diye).
         await self.refresh_equity()
         await self._validate_universe()
-
-        # Her paritenin kendi takipçisi; canlı ile kalibrasyon aynı sınıf.
-        dt = self.cfg.demo_test
-        for pair in self.pairs:
-            forced = bool(dt.enabled) and pair == dt.pair
-            self.trackers[pair] = SetupTracker(
-                rsi_threshold=self.cfg.signal.rsi_setup_threshold,
-                trigger_window=self.cfg.signal.trigger_window,
-                target_horizon=self.cfg.signal.time_stop_bars,
-                stop_atr_mult=self.cfg.risk.stop_atr_mult,
-                min_stop_bps=self.cfg.risk.min_stop_bps,
-                max_stop_bps=self.cfg.risk.max_stop_bps,
-                force_setup=forced,
-                force_trigger=forced,
-            )
-            self.spreads[pair] = SpreadWindow(self.cfg.micro.spread_median_window_sec)
 
         await self.refresh_equity()
         if self.state.day_start_equity is None:
@@ -640,73 +718,199 @@ class Agent:
         # Rejim açılışta hesaplanır (ilk 15m'e kadar "başlangıç" kalmasın); yorumcu da burada ilk kez çalışır.
         await self.refresh_regime(force=True)
 
-    async def _validate_universe(self) -> None:
-        """Evren doğrulaması: hacim + enstrüman kısıtları + boyutun minSz'ı geçmesi.
+    async def _select_candidates(self) -> tuple[list[str], str, dict[str, int], list[dict[str, Any]]]:
+        """Aday listesi HACİM SIRASIYLA. minSz'a hiç bakmaz — o `_validate_universe`'in işi.
 
-        Hacim iki kaynaktan ölçülür çünkü `market_filter` DEMO ORTAMINDA 0 SATIR döndürüyor
-        (filtresiz bile — canlı piyasa tarama aracı, demo'ya bağlı değil). Filtre satır
-        döndürürse birincil kaynak o; döndürmezse ticker'ın `volCcy24h`'i (kote cinsi hacim
-        ≈ USD) kullanılır ve bu durum loglanır.
+        `mode: auto` → `market_filter` (hacme göre azalan, `exclude` düşülür).
+        `mode: fixed` → `config.pairs` (geri dönüş yolu).
+        `market_filter` DEMO ORTAMINDA 0 SATIR döndürüyor (filtresiz bile; canlı piyasa tarama
+        aracı demo hesaba bağlı değil) → auto modda boş gelirse `config.pairs`'e düşülür ve
+        sebebi loglanır. `last` fiyatı filtre satırında varsa oradan alınır, yoksa ticker'dan.
         """
-        wanted = list(self.cfg.pairs)
-        min_vol = Decimal(str(self.cfg.universe.min_vol_usd_24h))
+        u = self.cfg.universe
+        mode = str(u.mode)
+        dropped: list[dict[str, Any]] = []
+        self._filter_last = {}
+        if mode not in ("auto", "fixed"):
+            raise SystemExit(f"universe.mode={mode!r} tanınmıyor; 'auto' veya 'fixed' olmalı.")
+        if mode == "fixed":
+            return list(self.cfg.pairs), "config.pairs", {}, dropped
+
         rows = await self.t.filter_instruments(
-            instType="SPOT", quoteCcy="USDT",
-            minVolUsd24h=self.cfg.universe.min_vol_usd_24h,
+            instType="SPOT", quoteCcy=u.quote,
+            minVolUsd24h=u.min_vol_usd_24h,
             sortBy="volUsd24h", sortOrder="desc",
-            limit=self.cfg.universe.filter_limit,  # 100 tavan, metotta zorlanıyor
+            limit=u.filter_limit,  # 100 tavan, metotta zorlanıyor
         )
-        liquid = {r["instId"] for r in rows}
-        vol_source = "market_filter" if rows else "ticker.volCcy24h"
         if not rows:
             self.decide("WAIT", gate="universe",
-                        reason="market_filter 0 satır döndü (demo ortamı); hacim ticker'dan ölçülüyor")
-            print("  NOT: market_filter 0 satır döndü → hacim ticker.volCcy24h'ten ölçülüyor")
+                        reason="market_filter 0 satır döndü (demo ortamı); auto evren "
+                               "kurulamadı, config.pairs'e düşülüyor")
+            print("  NOT: market_filter 0 satır döndü → auto evren yok, config.pairs kullanılıyor")
+            return list(self.cfg.pairs), "config.pairs (market_filter 0 satır)", {}, dropped
 
-        notional = self.state.equity * Decimal(str(self.cfg.risk.position_pct))
+        exclude = set(u.exclude or [])
+        cands: list[str] = []
+        rank: dict[str, int] = {}
+        for i, r in enumerate(rows, 1):
+            pair = str(r.get("instId") or "")
+            if not pair:
+                continue
+            if pair in exclude:
+                dropped.append({"pair": pair, "rank": i, "reason": "exclude listesinde (stablecoin)"})
+                continue
+            rank[pair] = i
+            cands.append(pair)
+            if r.get("last"):
+                self._filter_last[pair] = r["last"]
+        return cands, "market_filter", rank, dropped
+
+    async def _validate_universe(self, refresh: bool = False) -> None:
+        """Adayları minSz'dan geçir, HACİM SIRASINDA ilk `top_n` geçeni evrene al.
+
+        İstek bütçesi: enstrüman kısıtları parite başına değil TEK istekte alınır
+        (`get_instruments("SPOT")` instId vermeden tüm spot enstrümanları döndürüyor) —
+        20 paritede 40 isteği 1'e indiriyor. Fiyat filtre satırındaki `last`'tan gelir;
+        yoksa yalnız o aday için ticker'a düşülür.
+
+        `refresh=True` (saat başı): açık pozisyonu/bekleyen emri olan parite evrende TUTULUR.
+        Düşerse `bars_held` sayacı ilerlemez, zaman stopu hiç tetiklenmez.
+        """
+        cands, vol_source, rank, dropped = await self._select_candidates()
+        u = self.cfg.universe
+        auto = vol_source == "market_filter"
+        top_n = int(u.top_n) if auto else len(cands)
+        min_vol = Decimal(str(u.min_vol_usd_24h))
+
+        notional = self.state.equity * Decimal(str(self.risk_params().position_pct))
         if notional <= 0:
             notional = Decimal("9")  # equity henüz okunmadıysa strateji.md §10 referans boyutu
 
-        for pair in wanted:
-            inst = (await self.t.get_instruments("SPOT", pair))[0]
+        specs = {str(r.get("instId")): r for r in await self.t.get_instruments("SPOT")}
+        selected: list[str] = []
+        inst_new: dict[str, dict[str, Decimal]] = {}
+
+        for pair in cands:
+            if len(selected) >= top_n:
+                dropped.append({"pair": pair, "rank": rank.get(pair), "reason": f"top_n {top_n} doldu"})
+                continue
+            inst = specs.get(pair)
+            if inst is None:
+                self._drop_pair(pair, "enstrüman listesinde yok", dropped, rank)
+                continue
+            if inst.get("state") != "live":
+                self._drop_pair(pair, f"state={inst.get('state')}", dropped, rank)
+                continue
             tick = Decimal(str(inst["tickSz"]))
             lot = Decimal(str(inst["lotSz"]))
             min_sz = Decimal(str(inst["minSz"]))
-            ticker = await self.t.get_ticker(pair)
-            last = Decimal(str(ticker["last"]))
-            quote_vol = Decimal(str(ticker.get("volCcy24h") or 0))
+
+            last_raw = self._filter_last.get(pair)
+            if last_raw is None:
+                ticker = await self.t.get_ticker(pair)
+                last_raw = ticker["last"]
+                if not auto:  # fixed/demo yolunda hacim otoritesi ticker
+                    quote_vol = Decimal(str(ticker.get("volCcy24h") or 0))
+                    if quote_vol < min_vol:
+                        self._drop_pair(pair, f"hacim yetersiz (volCcy24h={quote_vol:,.0f}, "
+                                              f"min {min_vol:,.0f})", dropped, rank)
+                        continue
+            last = Decimal(str(last_raw))
+            if last <= 0:
+                self._drop_pair(pair, "fiyat 0/negatif", dropped, rank)
+                continue
+
             sz = q_sz(notional / last, lot)
-
-            if rows:
-                enough = pair in liquid
-                vol_note = f"filtrede {'var' if enough else 'YOK'}"
-            else:
-                enough = quote_vol >= min_vol
-                vol_note = f"volCcy24h={quote_vol:,.0f}"
-            if not enough:
-                self.decide("WAIT", symbol=pair, gate="universe", vol_source=vol_source,
-                            reason=f"hacim yetersiz ({vol_note}, min {min_vol:,.0f})")
-                print(f"  {pair}: EVRENDEN DÜŞTÜ — hacim yetersiz ({vol_note})")
-                continue
-            if inst.get("state") != "live":
-                self.decide("WAIT", symbol=pair, gate="universe", reason=f"state={inst.get('state')}")
-                print(f"  {pair}: EVRENDEN DÜŞTÜ — state={inst.get('state')}")
-                continue
             if sz < min_sz:
-                self.decide("WAIT", symbol=pair, gate="universe",
-                            reason=f"{notional} USDT → sz={dstr(sz)} < minSz={dstr(min_sz)}")
-                print(f"  {pair}: EVRENDEN DÜŞTÜ — sz {dstr(sz)} < minSz {dstr(min_sz)}")
+                self._drop_pair(pair, f"{notional} USDT → sz={dstr(sz)} < minSz={dstr(min_sz)}",
+                                dropped, rank)
                 continue
-            self.inst[pair] = {"tickSz": tick, "lotSz": lot, "minSz": min_sz}
-            self.pairs.append(pair)
-            print(f"  {pair}: OK · tickSz={dstr(tick)} lotSz={dstr(lot)} minSz={dstr(min_sz)} "
-                  f"· {notional} USDT → sz={dstr(sz)} ({float(sz / min_sz):.1f}× minSz)")
+            inst_new[pair] = {"tickSz": tick, "lotSz": lot, "minSz": min_sz}
+            selected.append(pair)
+            if not refresh:
+                print(f"  {pair}: OK · minSz={dstr(min_sz)} · {notional} USDT → sz={dstr(sz)} "
+                      f"({float(sz / min_sz):.1f}× minSz)")
 
-        if not self.pairs:
+        # Pozisyonu/bekleyen emri olan parite evrende KALIR (yenilemede kritik).
+        held = [p.pair for p in self.state.positions] + [p.pair for p in self.state.pending]
+        retained = [p for p in dict.fromkeys(held) if p not in selected and p in self.inst]
+        for pair in retained:
+            inst_new.setdefault(pair, self.inst[pair])
+            dropped.append({"pair": pair, "reason": "evren dışı ama açık pozisyon/emir var, TUTULDU"})
+
+        if not selected and not retained:
             raise SystemExit("Evrende hiç parite kalmadı; ajan başlatılmıyor.")
-        if self.cfg.regime_pair not in self.pairs:
+        self.inst = inst_new
+        self._apply_universe(selected + retained, vol_source, rank, dropped, refresh)
+
+    def _drop_pair(self, pair: str, reason: str, dropped: list[dict[str, Any]],
+                   rank: dict[str, int]) -> None:
+        dropped.append({"pair": pair, "rank": rank.get(pair), "reason": reason})
+        self.decide("WAIT", symbol=pair, gate="universe", reason=reason)
+
+    def _apply_universe(self, pairs: list[str], vol_source: str, rank: dict[str, int],
+                        dropped: list[dict[str, Any]], refresh: bool) -> None:
+        """Evreni yerine koy, eksik takipçi/spread penceresi kur, bütçeyi hesapla ve LOGLA."""
+        self.pairs = pairs
+        dt = self.cfg.demo_test
+        for pair in pairs:
+            if pair not in self.trackers:
+                forced = bool(dt.enabled) and pair == dt.pair
+                self.trackers[pair] = SetupTracker(
+                    rsi_threshold=self.cfg.signal.rsi_setup_threshold,
+                    trigger_window=self.cfg.signal.trigger_window,
+                    target_horizon=self.cfg.signal.time_stop_bars,
+                    stop_atr_mult=self.cfg.risk.stop_atr_mult,
+                    min_stop_bps=self.cfg.risk.min_stop_bps,
+                    max_stop_bps=self.cfg.risk.max_stop_bps,
+                    force_setup=forced,
+                    force_trigger=forced,
+                )
+            if pair not in self.spreads:
+                # Evrenden düşen paritenin penceresi SİLİNMEZ: zaman tabanlı olduğu için
+                # kendi kendini boşaltır, geri gelirse geçmişi hazır bulur.
+                self.spreads[pair] = SpreadWindow(self.cfg.micro.spread_median_window_sec)
+
+        budget = self.micro_budget()
+        self.micro_subsets = budget["subsets"]
+        self.last_universe_ms = now_ms()
+        self.decide("UNIVERSE", mode=str(self.cfg.universe.mode), pairs=pairs,
+                    volume_rank={p: rank[p] for p in pairs if p in rank},
+                    vol_source=vol_source, dropped=dropped,
+                    micro_subsets=budget["subsets"], micro_interval_sec=budget["interval_sec"],
+                    requests_per_turn=budget["per_turn"],
+                    requests_signal_turn=budget["signal_turn"],
+                    risk_level=self.risk_level,
+                    reason=f"{'yenileme' if refresh else 'açılış'}: {len(pairs)} parite "
+                           f"({vol_source}), {len(dropped)} aday elendi/tutuldu")
+        print(f"EVREN ({'yenileme' if refresh else 'açılış'}, {vol_source}): "
+              f"{len(pairs)} parite · {', '.join(pairs)}")
+        print(f"MİKRO BÜTÇE: {len(pairs)} parite / {budget['per_turn_pairs']} parite-tur = "
+              f"{budget['subsets']} alt küme · parite başına örnekleme "
+              f"{budget['interval_sec']} sn")
+        print(f"TUR İSTEĞİ: mikro {budget['micro']} + bakiye 1 = {budget['per_turn']} · "
+              f"sinyal turunda +{len(pairs)} mum +2 rejim = {budget['signal_turn']} "
+              f"(varsayım 20 istek/2 sn = 10 istek/sn)")
+        if self.cfg.regime_pair not in pairs:
             print(f"UYARI: rejim göstergesi {self.cfg.regime_pair} evrende yok; "
                   f"rejim yine onun mumlarıyla ölçülür ama sinyali kapalı.")
+
+    def micro_budget(self) -> dict[str, int]:
+        """Tur başına istek bütçesi. Varsayım: 20 istek / 2 sn (= 10 istek/sn)."""
+        n = len(self.pairs)
+        cap = max(1, int(self.cfg.micro.max_pairs_per_turn))
+        subsets = max(1, -(-n // cap)) if n else 1
+        per_turn_pairs = -(-n // subsets) if n else 0
+        micro = per_turn_pairs * 2  # orderbook + trades
+        per_turn = micro + 1  # + bakiye
+        return {
+            "subsets": subsets,
+            "per_turn_pairs": per_turn_pairs,
+            "interval_sec": int(self.cfg.micro.sample_sec) * subsets,
+            "micro": micro,
+            "per_turn": per_turn,
+            "signal_turn": per_turn + n + 2,  # + parite başına 1 mum sayfası + rejim
+        }
 
     async def refresh_equity(self) -> None:
         """`totalEq` = PnL ve kill switch tabanı. Boyut/bakiye kapısı `availBal` kullanır."""
@@ -719,31 +923,58 @@ class Agent:
 
     # ---- mikro katman (her tur) ----
 
-    async def sample_micro(self) -> None:
-        for pair in self.pairs:
-            fb0 = self.t.fallback_count
-            book = await self.t.get_orderbook(pair, sz=self.cfg.micro.orderbook_sz)
-            trades = await self.t.get_trades(pair, limit=self.cfg.micro.trades_limit)
-            sp = spread_bps(book)
-            row = {
-                "ts": datetime.now(tz=self.tz).isoformat(timespec="seconds"),
-                "symbol": pair,
-                # İki çağrıdan biri bile CLI'ya düştüyse örnek cli_fallback sayılır (Faz 7).
-                "transport": "cli_fallback" if self.t.fallback_count > fb0 else "mcp",
-                "obi": obi(book, self.cfg.micro.obi_band_bps),
-                "tfi": tfi(trades, self.cfg.micro.tfi_window_sec),
-                "spread_bps": None if sp is None else round(sp, 4),
-            }
-            top = book_top(book)
-            if top:
-                row["best_bid"], row["best_ask"] = top[0], top[1]
-            if sp is not None:
-                self.spreads[pair].push(now_ms(), sp)
-                med = self.spreads[pair].median()
-                row["spread_median_bps"] = None if med is None else round(med, 4)
-                row["spread_samples"] = len(self.spreads[pair])
-            self.micro_last[pair] = row
-            append_jsonl(MICRO, row)
+    async def sample_pair(self, pair: str) -> dict[str, Any]:
+        """Tek paritenin mikro örneği: 2 istek (orderbook + trades). `micro_last` + micro.jsonl.
+
+        Tetik anında da ÇAĞRILIR (`_handle_candidate`): alt küme örneklemesiyle son örnek
+        40 sn'ye kadar bayatlıyor ve bu veri hem mikro teyidi hem GİRİŞ LİMİT FİYATINI
+        (best_bid + 1 tick, risk kapısı kontrol 8) besliyor. strateji.md §4.3 zaten
+        "tetik anında tek örnek" diyor.
+        """
+        fb0 = self.t.fallback_count
+        book = await self.t.get_orderbook(pair, sz=self.cfg.micro.orderbook_sz)
+        trades = await self.t.get_trades(pair, limit=self.cfg.micro.trades_limit)
+        sp = spread_bps(book)
+        row: dict[str, Any] = {
+            "ts": datetime.now(tz=self.tz).isoformat(timespec="seconds"),
+            "symbol": pair,
+            # İki çağrıdan biri bile CLI'ya düştüyse örnek cli_fallback sayılır (Faz 7).
+            "transport": "cli_fallback" if self.t.fallback_count > fb0 else "mcp",
+            "obi": obi(book, self.cfg.micro.obi_band_bps),
+            "tfi": tfi(trades, self.cfg.micro.tfi_window_sec),
+            "spread_bps": None if sp is None else round(sp, 4),
+            # Alt küme örneklemesinde bu paritenin örnekleme aralığı — dashboard sparkline'ı
+            # ve okuyan insan noktaların kaç saniye arayla olduğunu bilsin (Faz 7.5).
+            "sample_interval_sec": int(self.cfg.micro.sample_sec) * self.micro_subsets,
+            "ms": now_ms(),
+        }
+        top = book_top(book)
+        if top:
+            row["best_bid"], row["best_ask"] = top[0], top[1]
+        if sp is not None:
+            self.spreads[pair].push(now_ms(), sp)
+            med = self.spreads[pair].median()
+            row["spread_median_bps"] = None if med is None else round(med, 4)
+            row["spread_samples"] = len(self.spreads[pair])
+        self.micro_last[pair] = row
+        append_jsonl(MICRO, row)
+        return row
+
+    def micro_subset(self) -> list[str]:
+        """Bu turda örneklenecek pariteler. 20 parite × 2 istek 20 sn'ye sığmıyor (Faz 7.5).
+
+        Dilimleme `[offset::subsets]`: alt kümeler ayrık, birleşimi tüm evren, ve hacim
+        sırası alt kümelere dağılıyor (ilk alt küme sadece en büyükleri almıyor).
+        """
+        if self.micro_subsets <= 1:
+            return list(self.pairs)
+        return self.pairs[self.turn % self.micro_subsets :: self.micro_subsets]
+
+    async def sample_micro(self) -> list[str]:
+        sampled = self.micro_subset()
+        for pair in sampled:
+            await self.sample_pair(pair)
+        return sampled
 
     def effective_spread(self, pair: str) -> tuple[float, str]:
         """Maliyet kapısının kullandığı spread: 30 dk medyan, yoksa config fallback (LOGLANIR)."""
@@ -960,7 +1191,11 @@ class Agent:
             self.decide("REJECT", gate="risk_hour", reason=reason, **base)
             return False
 
-        # 1) mikro teyit
+        # 1) mikro teyit — TETİK ANINDA TAZE ÖRNEK (strateji.md §4.3 "tetik anında tek örnek").
+        # Alt küme örneklemesiyle son örnek 40 sn'ye kadar bayat olabiliyor; bu satır hem
+        # teyidi hem giriş limit fiyatını (risk kapısı kontrol 8) aynı defterden besler.
+        fresh = await self.sample_pair(pair)
+        base["obi"], base["spread_bps"] = fresh.get("obi"), fresh.get("spread_bps")
         ok, reason = self._micro_confirm(pair)
         if not ok:
             self.decide("REJECT", gate="micro", reason=reason, **base)
@@ -1024,7 +1259,9 @@ class Agent:
         Aşılamaz katman: emre giden tek yol burası. `size_mult` (LLM REDUCE) yalnızca KÜÇÜLTÜR
         (0.3–1.0, judge.py kırpar); minSz kontrolü çarpandan SONRA yapılır.
         """
-        r, zero = self.cfg.risk, Decimal(0)
+        # `risk_params()`: `risk:` bloğu + aktif operatör seviyesinin beş anahtarı (Faz 7.5).
+        # Strateji eşikleri (stop bandı) seviyeden bağımsız, aynı sözlükten okunur.
+        r, zero = self.risk_params(), Decimal(0)
         now = now_ms()
 
         if not orders_allowed:
@@ -1426,8 +1663,10 @@ class Agent:
         if pnl["net_bps"] is not None:
             if pnl["net_bps"] < 0:
                 self.state.consecutive_losses += 1
+                # cooldown_losses seviyeden bağımsız, cooldown_sec seviyeye bağlı (Faz 7.5).
                 if self.state.consecutive_losses >= self.cfg.risk.cooldown_losses:
-                    self.state.cooldown_until_ms = now_ms() + self.cfg.risk.cooldown_sec * 1000
+                    cd = int(self.risk_params().cooldown_sec)
+                    self.state.cooldown_until_ms = now_ms() + cd * 1000
             else:
                 self.state.consecutive_losses = 0
         return pnl
@@ -1538,7 +1777,9 @@ class Agent:
 
     async def tick(self) -> None:
         self.turn += 1
+        turn_started = now_ms()
         fb_turn_start = self.t.fallback_count
+        req_turn_start = self.t.request_count
         control = read_control()
         mode = control["mode"]
         orders_allowed = mode == "run"
@@ -1556,6 +1797,24 @@ class Agent:
             print("OPERATÖR: flatten=true")
         self._last_flatten = control["flatten"]
 
+        # Risk seviyesi: turun BAŞINDA okunur. Açık pozisyonlara dokunulmaz — yeni girişlerin
+        # boyutu ve tavanları değişir, mevcut TP/SL emirleri borsada olduğu gibi kalır.
+        level = self._resolve_risk_level(control["risk_level"])
+        if level != self._last_risk_level:
+            self.state.risk_level = level
+            rp = self.risk_params()
+            params = {k: rp[k] for k in LEVEL_KEYS}
+            self.decide("OPERATOR_RISK_LEVEL", old=self._last_risk_level, new=level,
+                        params=params, open_positions_untouched=len(self.state.positions),
+                        reason=f"risk seviyesi {self._last_risk_level} → {level}: "
+                               f"boyut %{float(rp.position_pct) * 100:g}, eşzamanlı "
+                               f"{rp.max_concurrent}, günlük tavan {rp.max_daily_trades}, "
+                               f"kill {rp.kill_switch_daily_pct}%, cooldown "
+                               f"{int(rp.cooldown_sec) // 60} dk. Açık pozisyonlara dokunulmadı.")
+            print(f"OPERATÖR: risk seviyesi {self._last_risk_level} → {level} · {params}")
+            self._last_risk_level = level
+        self.state.risk_level = level
+
         if mode == "kill":
             # Acil Durdur: döngü TEMİZ çıkar. Pozisyonlar kapatılmaz — borsadaki TP/SL onları
             # korumaya devam eder; hepsini kapatmak ayrı bir eylem (flatten).
@@ -1572,7 +1831,13 @@ class Agent:
             return
 
         await self.refresh_equity()
-        await self.sample_micro()
+
+        # Saat başı evren yenilemesi (Faz 7.5). Mikro örneklemeden ÖNCE: yeni pariteler bu
+        # turda örneklensin, düşenler boşuna istek harcamasın.
+        if now_ms() - self.last_universe_ms >= int(self.cfg.universe.refresh_sec) * 1000:
+            await self._validate_universe(refresh=True)
+
+        sampled = await self.sample_micro()
         await self.check_pending()
 
         local = datetime.now(tz=self.tz)
@@ -1621,6 +1886,14 @@ class Agent:
         self.state.last_tick_ts = datetime.now(tz=self.tz).isoformat(timespec="seconds")
         # Tur bazında aktarım: turda bir çağrı bile CLI'ya düştüyse rozet turuncu yanar (Faz 7).
         self.state.transport = "cli_fallback" if self.t.fallback_count > fb_turn_start else "mcp"
+        # Tur bütçesi ÖLÇÜLÜR, tahmin edilmez (Faz 7.5): 20 parite 20 sn'ye sığıyor mu?
+        self.state.turn_requests = self.t.request_count - req_turn_start
+        self.state.turn_ms = now_ms() - turn_started
+        subset_no = (self.turn % self.micro_subsets) + 1 if self.micro_subsets > 1 else 1
+        print(f"tur {self.turn}: {self.state.turn_requests} istek / "
+              f"{self.state.turn_ms / 1000:.1f} sn · mikro {len(sampled)} parite "
+              f"(alt küme {subset_no}/{self.micro_subsets}, parite başına "
+              f"{int(self.cfg.micro.sample_sec) * self.micro_subsets} sn)")
         self.state.save()
 
     async def run(self) -> int:

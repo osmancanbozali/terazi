@@ -100,9 +100,12 @@ daha düşebilir; bandın içine geri kapanış, satıcıların gücünün kır�
 
 ### 4.3 Mikro yapı teyidi — "Emir defteri de aynı şeyi söylüyor mu?"
 
-Tetik anında tek örnek: `OBI(±10bps) ≥ 0` VE `spread ≤ 2 × son 30 dk medyan spread`.
+**Tetik anında TEK ÖRNEK** — aday kapıya girerken o parite için taze bir defter örneği alınır (Faz 7.5: evren 20 pariteye çıkınca örnekleme alt kümelere bölündü, son tur örneği 40 sn'ye kadar bayat olabiliyor; hem bu teyit hem giriş limit fiyatı taze defterden gelmeli): `OBI(±10bps) ≥ 0` VE `spread ≤ 2 × son 30 dk medyan spread`.
 Bu katman ayrıca gün boyu her 20 saniyede örnek alıp `micro.jsonl`'e yazar; dashboard'da sparkline
-olarak görünür.
+olarak görünür. 20 parite × 2 istek bir 20 sn'lik tura sığmadığı için pariteler alt kümelere
+bölünür (`micro.max_pairs_per_turn`); her paritenin örnekleme aralığı satırda `sample_interval_sec`
+olarak yazılır. 30 dk medyan penceresi ZAMAN tabanlıdır, seyrek örneklemede pencere değişmez,
+içindeki örnek sayısı düşer.
 
 ### 4.4 Maliyet kapısı — "Bu işlem komisyonu karşılar mı?"
 
@@ -226,25 +229,25 @@ Faz 2'de `config.yaml` oluşturuldu; aşağıdaki tablo **o dosyadaki gerçek de
 
 | Parametre | Değer | Not |
 |---|---|---|
-| pariteler | BTC-USDT, ETH-USDT, SOL-USDT, **XRP-USDT, DOGE-USDT** | Faz 2'de 5'e çıkarıldı; hepsi ≥10M USD hacim filtresinde, 9 USDT hepsinde minSz'ı karşılıyor (en dar XRP 6,6×). Açılışta doğrulanır, geçmeyen evrenden düşer ve loglanır |
+| pariteler | **evren otomatik: hacme göre ilk 20** (`universe.mode: auto`) | Faz 7.5: `market_filter` ile ≥10M USD hacim, stablecoin çiftleri `exclude`, minSz'ı geçen ilk `top_n`. **ÖLÇÜM: bu borsada 10M eşiğini geçen yalnız ~15 USDT paritesi var**, yani 20 tavanı bağlamıyor — bağlayıcı olan hacim tabanı (5M→29, 2M→51 satır). Açılışta ve **saat başı** yenilenir, seçim `UNIVERSE` satırına yazılır; açık pozisyonu olan parite evrenden düşmez. `mode: fixed` → yukarıdaki 5 parite (geri dönüş) |
 | rejim göstergesi | BTC-USDT | beş pariteye de uygulanır; BTC'nin kendi sinyali de açık |
-| sinyal zaman dilimi | 15m | kapanıştan 15 sn sonra işlenir |
+| sinyal zaman dilimi | **5m** | Faz 7.5: 15m → 5m, kapanıştan 15 sn sonra işlenir (:00/:05/:10…). Eşiklerin hiçbiri değişmedi |
 | rejim zaman dilimi | 1H, son 48 mum | 30 dk'da bir yenilenir |
 | BB | 20, 2σ (popülasyon, ddof=0) | |
 | RSI kurulum eşiği | **36** | kalibrasyon sonrası seçildi — **sinyal sıklığına göre**, kazanma yüzdesine göre değil (örneklem küçük, aşırı uydurma riski) |
 | tetik penceresi | 2 mum | |
-| zaman stopu | **12 kapanmış mum** | kalibrasyon: j+8 çıkışı ham +1,1 bps, komisyonla −16,9 bps → erken çıkış kâr kaynağı değil, ufku aç |
+| zaman stopu | **24 kapanmış mum** | Faz 7.5: 5m × 24 = 2 saat, 15m × 12 ile AYNI süre. Kalibrasyon gerekçesi aynı: j+8 çıkışı ham +1,1 bps, komisyonla −16,9 bps → erken çıkış kâr kaynağı değil |
 | OBI bant / eşik | ±10 bps / ≥ 0 | |
 | spread eşiği | 2 × 30 dk medyan | medyan yoksa **fallback 2 bps** ve loglanır |
 | maliyet çarpanı | 2,5 | ölçülen maker 8,0 bps → maliyet 18,0 bps → kapı 45,0 bps |
 | vol kesici | son mum aralığı > 3×ATR → 30 dk | |
-| pozisyon boyutu | equity × %30 | |
-| eşzamanlı pozisyon | 2 | parite başına en fazla 1 |
+| pozisyon boyutu | equity × %30 (**dengeli**) | Faz 7.5: operatör seviyesine bağlı — temkinli %20 · dengeli %30 · agresif %40 |
+| eşzamanlı pozisyon | 2 (**dengeli**) | temkinli 1 · dengeli 2 · agresif 3; parite başına en fazla 1 |
 | stop | setup_low − 0,2×ATR; **bant 50–120 bps** | 50'nin altı 50'ye çekilir, 120'nin üstü **reddedilir** |
 | hedef | BB_mid, maker limit satış (`tpOrdKind: limit`) | |
-| kill switch | −%1,5 günlük | |
-| cooldown | 2 ardışık kayıp → 45 dk | |
-| günlük işlem tavanı | 8 | |
+| kill switch | −%1,5 günlük (**dengeli**) | temkinli −%1,0 · dengeli −%1,5 · agresif −%2,5 |
+| cooldown | 2 ardışık kayıp → 45 dk (**dengeli**) | kayıp sayısı seviyeden bağımsız; süre temkinli 60 · dengeli 45 · agresif 30 dk |
+| günlük işlem tavanı | 8 (**dengeli**) | temkinli 4 · dengeli 8 · agresif 12 |
 | limit emir ömrü | 90 sn | dolmazsa iptal, aday düşer |
 | uzlaştırma periyodu | 60 sn | borsa kaynak gerçek |
 | son giriş / kapanış saati | 18:30 / 19:10 (Europe/Istanbul) | |

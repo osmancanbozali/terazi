@@ -76,11 +76,17 @@ def load_cfg() -> dict[str, Any]:
         print(f"config.yaml okunamadı ({exc}); varsayılanlarla devam.", file=sys.stderr)
         cfg = {}
     dash = cfg.get("dashboard") or {}
+    levels = dict(cfg.get("risk_levels") or {})
+    default_level = str(levels.pop("default", "balanced"))
     return {
         "tz": ZoneInfo((cfg.get("execution") or {}).get("timezone", "Europe/Istanbul")),
         "kill_switch_daily_pct": (cfg.get("risk") or {}).get("kill_switch_daily_pct", -1.5),
         "poll_sec": float(dash.get("poll_ms", 2000)) / 1000.0,
         "stale_sec": float(dash.get("alive_threshold_s", 60)),
+        # Risk seviyeleri (Faz 7.5). İzinli değerler TEK KAYNAK config: /control burada
+        # olmayan bir seviyeyi 400 ile reddeder, ekran seçiciyi buradan çizer.
+        "risk_levels": levels,
+        "risk_level_default": default_level,
     }
 
 
@@ -150,9 +156,17 @@ def write_control(patch: dict[str, Any]) -> dict[str, Any]:
     Ajan her turun başında bu dosyayı okuyor; yarım yazılmış JSON görmemeli. Geçici dosya +
     os.replace ile tek adımda yerine geçer. Birleştirme, mode yazarken flatten'ı (ve tersini)
     korur.
+
+    `risk_level` de TAŞINIR (Faz 7.5): beyaz liste iki anahtarda kalsaydı "Duraklat"a basmak
+    operatörün seviye seçimini sessizce silerdi. terazi.write_control aynı disiplinde.
     """
     cur = read_json(CONTROL)
-    merged = {"mode": cur.get("mode", "run"), "flatten": bool(cur.get("flatten", False))}
+    merged: dict[str, Any] = {
+        "mode": cur.get("mode", "run"),
+        "flatten": bool(cur.get("flatten", False)),
+    }
+    if cur.get("risk_level"):
+        merged["risk_level"] = str(cur["risk_level"])
     merged.update(patch)
     tmp = CONTROL.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -334,7 +348,15 @@ def get_state() -> dict[str, Any]:
 
     return {
         "state": state,
-        "control": {"mode": control.get("mode", "run"), "flatten": bool(control.get("flatten", False))},
+        "control": {
+            "mode": control.get("mode", "run"),
+            "flatten": bool(control.get("flatten", False)),
+            # Aktif seviyenin otoritesi control.json; operatör hiç seçmediyse ajanın
+            # state.json'a aynaladığı değer, o da yoksa config varsayılanı.
+            "risk_level": (control.get("risk_level") or state.get("risk_level")
+                           or CFG["risk_level_default"]),
+        },
+        "risk_levels": CFG["risk_levels"],
         "agent_alive": state_age is not None and state_age <= CFG["stale_sec"],
         "state_age_sec": None if state_age is None else round(state_age, 1),
         "stale_sec": CFG["stale_sec"],
@@ -449,26 +471,44 @@ def get_micro(minutes: int = MICRO_WINDOW_MIN) -> dict[str, Any]:
 class ControlBody(BaseModel):
     mode: str | None = None
     flatten: bool | None = None
+    risk_level: str | None = None
     confirm: bool = False
 
 
 @app.post("/control")
 def post_control(body: ControlBody) -> dict[str, Any]:
-    """Operatör yüzeyi: run / pause / kill / flatten. AL-SAT YOK.
+    """Operatör yüzeyi: run / pause / kill / flatten / risk_level. AL-SAT YOK.
 
     Yalnızca `control.json` yazılır. OPERATOR_* satırını `decisions.jsonl`'e AJAN düşer (tek kaynak);
     dashboard log yazmaz — görünmez müdahale yok, çift satır da yok.
     """
-    if body.mode is None and body.flatten is None:
-        raise HTTPException(status_code=400, detail="Gövdede mode veya flatten olmalı.")
-    if body.mode is not None and body.flatten is not None:
-        raise HTTPException(status_code=400, detail="mode ve flatten aynı istekte gönderilemez.")
+    given = [name for name, val in (("mode", body.mode), ("flatten", body.flatten),
+                                    ("risk_level", body.risk_level)) if val is not None]
+    if not given:
+        raise HTTPException(status_code=400,
+                            detail="Gövdede mode, flatten veya risk_level olmalı.")
+    if len(given) > 1:
+        raise HTTPException(status_code=400,
+                            detail=f"Tek istekte tek alan: {', '.join(given)} birlikte gönderilemez.")
 
     if body.flatten is not None:
         if not body.flatten:
             raise HTTPException(status_code=400, detail="flatten yalnızca true olarak gönderilir.")
         action, patch = "OPERATOR_FLATTEN", {"flatten": True}
         needs_confirm = True
+    elif body.risk_level is not None:
+        # İzinli değerler TEK KAYNAK config.yaml `risk_levels`. Yıkıcı eylem değil → onay yok:
+        # açık pozisyonlara dokunmaz, yalnız yeni girişlerin boyutunu/tavanlarını değiştirir.
+        levels = CFG["risk_levels"]
+        if body.risk_level not in levels:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Geçersiz risk_level '{body.risk_level}'. Geçerli: "
+                       f"{', '.join(levels) or '(config.yaml risk_levels tanımlı değil)'}. "
+                       "control.json'a hiçbir şey yazılmadı.",
+            )
+        action, patch = "OPERATOR_RISK_LEVEL", {"risk_level": body.risk_level}
+        needs_confirm = False
     else:
         mode = body.mode
         if mode not in MODES:

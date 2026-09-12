@@ -2,23 +2,31 @@
 # CLAUDE.md kuralı: sayısal eşik koda gömülmez. Kodda sabit sayı arıyorsan yanlış yerdesin.
 # Değerler docs/strateji.md §10 ve docs/kalibrasyon.md kararlarından geldi.
 
-pairs: [BTC-USDT, ETH-USDT, SOL-USDT, XRP-USDT, DOGE-USDT]
+pairs: [BTC-USDT, ETH-USDT, SOL-USDT, XRP-USDT, DOGE-USDT]   # universe.mode: fixed'de kullanılır
 regime_pair: BTC-USDT          # rejim göstergesi; BTC'nin kendi sinyali de açık
 
 universe:
+  mode: auto                   # auto = hacme göre ilk top_n · fixed = yukarıdaki `pairs` (geri dönüş)
+  top_n: 20                    # minSz'ı geçen ilk N parite
+  quote: USDT
   min_vol_usd_24h: "10000000"  # market_filter minVolUsd24h
   filter_limit: 100            # market_filter tavanı; >100 → kod 902 (Faz 1'de ölçüldü)
+  refresh_sec: 3600            # saat başı yeniden seçim
+  # Stablecoin/sabit kur çiftleri: ortalamaya dönüş için hareket yok, hacimleri yüksek olduğu
+  # için sıralamanın tepesine çıkarlar. Maliyet kapısı da elerdi; burada açıkça eliyoruz.
+  exclude: [USDC-USDT, DAI-USDT, TUSD-USDT, FDUSD-USDT, USDG-USDT, PYUSD-USDT,
+            BUSD-USDT, USDE-USDT, EURT-USDT, XAUT-USDT]
 
 signal:
-  bar: 15m
+  bar: 5m                      # Faz 7.5: 15m → 5m (fırsat yüzeyi; eşikler DEĞİŞMEDİ)
   bb_period: 20
   bb_std: 2.0
   rsi_period: 14
   atr_period: 14
   rsi_setup_threshold: 36      # sinyal SIKLIĞINA göre seçildi, kazanma yüzdesine göre DEĞİL
   trigger_window: 2            # kurulumdan sonra tetik için mum sayısı
-  time_stop_bars: 12           # kalibrasyon: j+8 çıkışı komisyonla kayıp → ufku 12'ye aç
-  close_offset_sec: 15         # 15m kapanışından bu kadar sonra sinyal geçişi
+  time_stop_bars: 24           # 5m × 24 = 2 saat; 15m × 12 ile AYNI süre (Faz 7.5)
+  close_offset_sec: 15         # mum kapanışından bu kadar sonra sinyal geçişi
   warmup_bars: 120             # indikatör ısınması için ek mum
 
 regime:
@@ -31,12 +39,15 @@ regime:
 
 micro:
   sample_sec: 20               # bir tur
+  max_pairs_per_turn: 10       # bir turda en fazla kaç parite örneklenir (Faz 7.5 alt küme)
   obi_band_bps: 10             # OBI için orta fiyatın ±bandı
   obi_min: 0.0                 # mikro teyit: OBI ≥ bu
   tfi_window_sec: 60
   orderbook_sz: 20
   trades_limit: 100
-  spread_median_window_sec: 1800  # 30 dk medyan spread penceresi
+  # 30 dk medyan spread penceresi — ZAMAN tabanlı (örnek sayısı değil), bu yüzden alt küme
+  # örneklemesinde pencere 30 dk kalır, içindeki örnek sayısı düşer (20 paritede ~90 → ~45).
+  spread_median_window_sec: 1800
   spread_mult_max: 2.0         # mikro teyit: spread ≤ bu × medyan
   spread_bps_fallback: 2.0     # ölçülen medyan yoksa; kullanıldığında LOGLANIR
 
@@ -44,15 +55,29 @@ cost:
   multiplier: 2.5              # hedef_bps ≥ bu × (2×fee_bps + spread_bps)
 
 risk:
+  # Bu beş anahtar `risk_levels` ile SEVİYEYE BAĞLI olarak geçersiz kılınır (aşağı bak).
+  # Buradaki değerler `balanced` ile birebir aynı; seviye çözülemezse yine bunlar geçerli.
   position_pct: 0.30           # equity × bu (30 USDT'de ≈ 9 USDT)
   max_concurrent: 2
   max_daily_trades: 8
   kill_switch_daily_pct: -1.5
-  cooldown_losses: 2
   cooldown_sec: 2700           # 45 dk
+  # Aşağıdakiler SEVİYEDEN BAĞIMSIZ — strateji eşikleri, tek yerde yaşar.
+  cooldown_losses: 2
   stop_atr_mult: 0.2           # stop = setup_low − bu × ATR
   min_stop_bps: 50             # stop bandı 50–120 bps; altındaysa 50'ye çekilir
   max_stop_bps: 120            # üstündeyse aday REDDEDİLİR
+
+# Operatör risk seviyeleri (Faz 7.5). SADECE bu beş parametre seviyeye bağlıdır; strateji
+# eşikleri (RSI 36, OBI ≥ 0, maliyet çarpanı 2.5, stop bandı 50–120) seviyeden BAĞIMSIZ.
+# Aktif seviye control.json'daki `risk_level`; ajan turun başında okur, state.json'a aynalar.
+# Birimler `risk:` bloğuyla aynı: position_pct kesir, kill_switch_daily_pct İŞARETLİ yüzde,
+# cooldown_sec saniye.
+risk_levels:
+  default: balanced
+  cautious:   {position_pct: 0.20, max_concurrent: 1, max_daily_trades: 4,  kill_switch_daily_pct: -1.0, cooldown_sec: 3600}
+  balanced:   {position_pct: 0.30, max_concurrent: 2, max_daily_trades: 8,  kill_switch_daily_pct: -1.5, cooldown_sec: 2700}
+  aggressive: {position_pct: 0.40, max_concurrent: 3, max_daily_trades: 12, kill_switch_daily_pct: -2.5, cooldown_sec: 1800}
 
 execution:
   limit_order_ttl_sec: 90      # dolmazsa spot_cancel_order, aday düşer

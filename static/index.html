@@ -123,6 +123,11 @@
       <span id="mode-badge" class="px-2 py-0.5 rounded font-mono font-semibold">…</span>
       <span id="flatten-badge" class="hidden px-2 py-0.5 rounded font-mono bg-amber-950 text-amber-300 border border-amber-800">flatten=true</span>
     </div>
+    <!-- risk seviyesi: boyut + tavanları değiştirir, AÇIK POZİSYONLARA DOKUNMAZ. Al/sat değil. -->
+    <div class="ml-3 flex items-center gap-2 text-[11px]">
+      <span class="text-slate-500">risk seviyesi</span>
+      <div id="risk-levels" class="flex items-center gap-1"></div>
+    </div>
     <div class="ml-auto text-[11px] text-slate-600">Al/sat düğmesi yoktur — operatör yüzeyi yalnızca duraklat / durdur / kapat.</div>
   </footer>
 </div>
@@ -152,6 +157,7 @@ const ACTION_STYLE = {
   CASH:      "bg-yellow-950 text-yellow-300 border-yellow-800",
   ERROR:     "bg-red-950 text-red-300 border-red-700",
   EOD_FLATTEN_DONE: "bg-yellow-900 text-yellow-200 border-yellow-700",
+  UNIVERSE:  "bg-sky-950 text-sky-300 border-sky-800",   // evren seçimi (Faz 7.5)
 };
 // Kapanan işlemin çıkış sebebi: tp yeşil · sl kırmızı · diğerleri nötr
 const EXIT_STYLE = {
@@ -250,6 +256,23 @@ function renderCards(s) {
     out.push(card("ajan", `<span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-1.5 align-middle pulse"></span>AJAN YANIT VERMİYOR`,
                   "bg-red-950 border-red-700 text-red-300",
                   `state.json ${s.state_age_sec ?? "?"} sn önce yazıldı (eşik ${s.stale_sec} sn)`));
+  }
+
+  // risk seviyesi rozeti (Faz 7.5): aktif seviye + o seviyenin beş parametresi tooltip'te
+  const lvl = (s.control || {}).risk_level || "—", lp = (s.risk_levels || {})[lvl] || {};
+  out.push(card("seviye", esc(LEVEL_LABEL[lvl] || lvl),
+                LEVEL_STYLE[lvl] ? LEVEL_STYLE[lvl].replace("border border-", "border-") : "bg-slate-900/60 border-slate-800",
+                lp.position_pct == null ? "" :
+                  `boyut %${(Number(lp.position_pct) * 100).toFixed(0)} · eşzamanlı ${lp.max_concurrent} · ` +
+                  `günlük tavan ${lp.max_daily_trades} · kill ${lp.kill_switch_daily_pct}% · ` +
+                  `cooldown ${Math.round(Number(lp.cooldown_sec) / 60)} dk`));
+
+  // evren + tur bütçesi: 20 parite 20 sn'ye sığıyor mu? (Faz 7.5 ölçümü, state.json'dan)
+  if (st.turn_requests != null) {
+    out.push(card("tur", `${st.turn_requests} istek · ${((st.turn_ms || 0) / 1000).toFixed(1)} sn`,
+                  (st.turn_ms || 0) > 20000 ? "bg-orange-950/70 border-orange-800 text-orange-300"
+                                            : "bg-slate-900/60 border-slate-800",
+                  "son turda borsaya giden istek sayısı ve turun süresi (mikro periyodu 20 sn)"));
   }
 
   // aktarım: mcp yeşil · cli_fallback turuncu (urun-mimari.md §4 üst şerit)
@@ -476,10 +499,17 @@ function renderEquity(data) {
 const microCharts = {};
 let microKey = "";
 
+// Alt şerit beş sütunluk tek satır. Evren 20 pariteye çıktığı için (Faz 7.5) burada
+// KIRPILIR — 20 canvas'ı 5 sütuna sığdırmak şeridi taşırıyordu; kaçının gösterildiği yazılır.
+const MICRO_CARDS = 5;
+
 function renderMicro(data) {
   const pairs = data.pairs || {};
-  const names = Object.keys(pairs);
-  $("micro-meta").textContent = names.length ? `son ${data.minutes} dk` : "";
+  const all = Object.keys(pairs);
+  const names = all.slice(0, MICRO_CARDS);
+  $("micro-meta").textContent = all.length
+    ? `son ${data.minutes} dk` + (all.length > names.length ? ` · ${all.length} pariteden ilk ${names.length}` : "")
+    : "";
   if (!names.length) {
     $("micro-cards").innerHTML = `<div class="col-span-5 h-full flex items-center justify-center text-slate-600">mikro örnek yok</div>`;
     return;
@@ -620,7 +650,44 @@ async function askAgent(question) {
 }
 
 // ---- kontroller ------------------------------------------------------------
+// Seviye adı → rozet rengi: temkinli yeşil (en az risk) · dengeli sarı · agresif kırmızı.
+const LEVEL_STYLE = {
+  cautious:   "bg-green-950 text-green-300 border border-green-800",
+  balanced:   "bg-yellow-950 text-yellow-300 border border-yellow-800",
+  aggressive: "bg-red-950 text-red-300 border border-red-800",
+};
+const LEVEL_LABEL = { cautious: "Temkinli", balanced: "Dengeli", aggressive: "Agresif" };
+let levelKey = "";
+
+function renderRiskLevels(s) {
+  const levels = s.risk_levels || {}, names = Object.keys(levels);
+  const active = (s.control || {}).risk_level || "";
+  if (levelKey !== names.join(",")) {          // düğmeler bir kez kurulur
+    levelKey = names.join(",");
+    $("risk-levels").innerHTML = names.map(n => {
+      const p = levels[n] || {};
+      const title = `boyut %${(Number(p.position_pct) * 100).toFixed(0)} · eşzamanlı ${p.max_concurrent}` +
+                    ` · günlük tavan ${p.max_daily_trades} · kill ${p.kill_switch_daily_pct}%` +
+                    ` · cooldown ${Math.round(Number(p.cooldown_sec) / 60)} dk`;
+      return `<button data-level="${esc(n)}" title="${esc(title)}"
+                class="risk-level px-2 py-0.5 rounded font-mono text-[11px] border transition-colors">${esc(LEVEL_LABEL[n] || n)}</button>`;
+    }).join("");
+  }
+  for (const b of document.querySelectorAll(".risk-level")) {
+    const on = b.dataset.level === active;
+    b.className = "risk-level px-2 py-0.5 rounded font-mono text-[11px] border transition-colors " +
+      (on ? (LEVEL_STYLE[b.dataset.level] || "bg-slate-100 text-slate-900 border-slate-300") + " font-semibold"
+          : "bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-400");
+  }
+}
+
+$("risk-levels").addEventListener("click", e => {
+  const b = e.target.closest(".risk-level");
+  if (b) send({ risk_level: b.dataset.level });
+});
+
 function renderControl(s) {
+  renderRiskLevels(s);
   const mode = (s.control || {}).mode || "run";
   const badge = $("mode-badge");
   badge.textContent = mode;

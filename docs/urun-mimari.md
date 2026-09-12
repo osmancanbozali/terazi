@@ -48,8 +48,9 @@ olarak düşer; görünmez müdahale yok.
 terazi.py      ajan döngüsü        ──yazar──►  logs/decisions.jsonl, orders.jsonl, micro.jsonl,
                                                 llm.jsonl, state.json
 dashboard.py   FastAPI + index.html ◄──okur──  aynı dosyalar (2 sn polling)
-               ──yazar──►  control.json  {"mode":"run|pause|kill","flatten":false}
-terazi.py      ◄──okur──  control.json (her turun başında)
+               ──yazar──►  control.json  {"mode":"run|pause|kill","flatten":false,
+                                            "risk_level":"cautious|balanced|aggressive"}
+terazi.py      ◄──okur──  control.json (her turun başında; mode + flatten + risk_level)
 ```
 
 İki ayrı süreç; iletişim yalnızca dosya üzerinden. Dashboard çökerse ajan durmaz; ajan çökerse
@@ -84,15 +85,26 @@ dashboard "AJAN YANIT VERMİYOR" gösterir (state.json 60 sn'den eskiyse).
 ### 3.3 Ajan döngüsü
 
 ```
-her 20 sn        : control.json oku → 3 parite orderbook+trades → micro.jsonl
-15m kapanış+15 sn: candles → indikatörler → rejim (30 dk'da bir) → sinyal
-                   aday varsa: mikro teyit → maliyet kapısı → yargıç (LLM) → risk kapısı → emir
+her 20 sn        : control.json oku (mode + flatten + risk_level) → BİR ALT KÜME paritenin
+                   orderbook+trades → micro.jsonl · tur istek sayısı + süresi konsola
+5m kapanış+15 sn : candles → indikatörler → rejim (30 dk'da bir) → sinyal
+                   aday varsa: TAZE mikro örnek → mikro teyit → maliyet kapısı → yargıç (LLM)
+                   → risk kapısı → emir
 her 30 dk        : rejim yorumcusu (LLM, rejim hesabıyla aynı anda) → llm.jsonl + state.json
 her 60 sn        : açık emirler + bakiye ile uzlaş → zaman/gün sonu kontrolleri → state.json
+her saat         : evren yeniden seçilir (market_filter) → UNIVERSE satırı
 her tur          : state.json'a last_tick_ts (kalp atışı) — decisions.jsonl'e 20 sn'lik satır DÜŞMEZ
-15m geçişi       : parite başına en az bir satır (olay yoksa sayısal gerekçeli WAIT: "RSI 57.2 > 36")
+5m geçişi        : parite başına en az bir satır (olay yoksa sayısal gerekçeli WAIT: "RSI 57.2 > 36")
 her hata         : logla → 30 sn bekle → devam. Ajan asla tamamen durmaz.
 ```
+
+> Faz 7.5 — **evren, sinyal barı ve mikro örnekleme bütçesi.** Sinyal barı `signal.bar` ile 5m'ye
+> indi (`time_stop_bars` 24 = aynı 2 saatlik ufuk). Evren `universe.mode: auto` ile hacme göre
+> ilk `top_n` USDT paritesi; `mode: fixed` geri dönüş yolu açık. 20 parite × 2 istek bir 20 sn'lik
+> tura sığmadığı için mikro örnekleme alt kümelere bölünür (`micro.max_pairs_per_turn`), parite
+> başına aralık `sample_interval_sec` olarak her satıra yazılır. **Aday kapıya girerken o parite
+> için taze örnek alınır** — bayat defter hem mikro teyidi hem giriş limit fiyatını besliyordu.
+> Enstrüman kısıtları parite başına değil tek `market_get_instruments` isteğiyle alınır.
 
 > Faz 5 kararı: yargıç maliyet kapısından SONRA çağrılır — maliyet adayların çoğunu eler, elenen aday
 > için LLM ve haber aracı çağrılmaz. Fren rolü değişmez (strateji.md §4.5).
@@ -104,9 +116,13 @@ her hata         : logla → 30 sn bekle → devam. Ajan asla tamamen durmaz.
  "action":"REJECT","gate":"cost","reason":"hedef 79bps < 2.5×maliyet 45bps",
  "equity":30.1,"daily_pnl_pct":0.0,"open_positions":0,"transport":"mcp"}
 ```
-`action` değerleri: `WAIT | SETUP | CANDIDATE | REJECT | ORDER | FILL | EXIT | CASH | EOD_FLATTEN_DONE |
-OPERATOR_PAUSE | OPERATOR_RESUME | OPERATOR_KILL | OPERATOR_KILL_CLEARED | OPERATOR_FLATTEN |
-OPERATOR_FLATTEN_DONE | ERROR`.
+`action` değerleri: `WAIT | SETUP | CANDIDATE | REJECT | ORDER | FILL | EXIT | CASH | UNIVERSE |
+EOD_FLATTEN_DONE | OPERATOR_PAUSE | OPERATOR_RESUME | OPERATOR_KILL | OPERATOR_KILL_CLEARED |
+OPERATOR_FLATTEN | OPERATOR_FLATTEN_DONE | OPERATOR_RISK_LEVEL | ERROR`.
+`UNIVERSE` (Faz 7.5) seçilen pariteleri hacim sırasıyla, elenenleri sebebiyle ve tur istek
+bütçesini taşır; **operatör eylemi değildir**, `OPERATOR_*` kovasına girmez.
+`OPERATOR_RISK_LEVEL` operatörün risk seviyesi değişimini `old`/`new` ve yeni beş parametreyle
+yazar; **açık pozisyonlara dokunulmaz.**
 `EXIT` satırı (Faz 7) komisyonlu sonucu taşır: `exit_reason` (`tp|sl|tp_sl|time|eod|operator`),
 `gross_bps`, `fee_bps`, `net_bps`, `net_pnl_usdt`, `fee_paid`. Aynı kayıt `state.json`'daki
 `closed_positions` listesine de düşer; dashboard "Kapanan işlemler" kartı oradan okur.

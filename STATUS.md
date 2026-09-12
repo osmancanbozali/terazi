@@ -1,5 +1,226 @@
 # STATUS
 
+## Faz 7.5 — evren genişletme + 5m sinyal + risk seviyeleri: TAMAM (12 Eylül, 17:20 +03:00)
+
+**Teslimat:** `config.yaml` (`universe` genişletildi, `signal.bar` 5m, `time_stop_bars` 24,
+`micro.max_pairs_per_turn`, yeni `risk_levels` bloğu), `terazi.py` (evren seçimi + saat başı
+yenileme, alt küme örnekleme, `risk_params()`, tur istek sayacı, bar guard), `tools.py`
+(`request_count`), `dashboard.py` (`/control` risk_level + `/state`), `static/index.html`
+(seviye seçici + 2 yeni kart + `UNIVERSE` rozeti + mikro şeridi kırpma), `calibrate.py`
+(TOPLAM satırı + öz-test düzeltmesi), `docs/kalibrasyon-5m.md` (yeni), `docs/strateji.md`,
+`docs/urun-mimari.md`.
+**Canlı ajana dokunulmadı, yeniden başlatılmadı** (PID 53254, 16:12'den beri). Tüm testler
+scratch dizinindeki izole sandbox kopyasında, `--dry-run` ile; canlı `logs/`, `state.json`,
+`control.json` hiç açılmadı. Kalibrasyon canlı profille ama **salt okunur** (sürücü
+`expected_demo` vermiyor → emir kapısı kapalı), yalnız `docs/kalibrasyon-5m.md` yazdı.
+
+### ⚠️ ÖLÇÜM: `top_n: 20` bu borsada BAĞLAMIYOR — bağlayıcı olan hacim tabanı
+`market_filter(instType=SPOT, quoteCcy=USDT, minVolUsd24h=…)` satır sayısı, canlı profilde ölçüldü:
+
+| minVolUsd24h | satır |
+|---|---|
+| 10.000.000 (config) | **15** |
+| 5.000.000 | 29 |
+| 2.000.000 | 51 |
+| 1.000.000 | 87 |
+| 0 | 100 (tavan) |
+
+10M eşiğini geçen tüm USDT spot evreni **15 parite**. Stablecoin `exclude` 2, minSz 1 düşürünce
+evren **12–13 parite** oluyor; `top_n: 20` hiç devreye girmiyor. 20 pariteye çıkmak için
+`universe.min_vol_usd_24h`'i ~5M'e indirmek gerekir — **bu bir likidite kararı olduğu için
+yapılmadı**, config'de tek satır (spread genişler, mikro ve maliyet kapıları daha çok reddeder,
+minSz daralır). Evren sınırda oynak: iki koşu arasında OKB-USDT 10M'in altına düştü ve evren
+13'ten 12'ye indi — saat başı yenileme bunu zaten karşılıyor, her seçim `UNIVERSE` satırında.
+
+### 1) Sinyal barı config'den — kod değişikliği neredeyse yok
+`terazi.py` barı zaten `cfg.signal.bar`'dan okuyordu, `BAR_MS`'te `5m` vardı, `confirm` filtresi
+yerindeydi. Tek dokunuş **bar guard**: `BAR_MS[bar]` tanınmayan barda çıplak `KeyError` atıyordu
+("1h" gibi bir yazım hatası ajanı anlaşılmaz biçimde düşürürdü); `startup()` artık `signal.bar`
+ve `regime.bar`'ı `BAR_MS`'e karşı doğrulayıp Türkçe `SystemExit` veriyor. `time_stop_bars: 24`
+(5m × 24 = 2 saat, 15m × 12 ile **aynı süre**). Rejim 1H/48 mum **değişmedi**. Strateji
+eşiklerinin hiçbiri değişmedi.
+
+### 2) Evren: auto mod + saat başı yenileme
+- `_validate_universe` üçe bölündü: `_select_candidates` (hacim sırası, `exclude`),
+  `_validate_universe` (minSz süzgeci, ilk `top_n`), `_apply_universe` (takipçi/pencere kurulumu,
+  bütçe hesabı, `UNIVERSE` satırı). `mode: fixed` geri dönüş yolu açık, test edildi.
+- **İstek bütçesi 45'ten 2'ye indi:** `get_instruments("SPOT")` instId **vermeden** tüm spot
+  enstrümanları tek istekte döndürüyor (tickSz/lotSz/minSz/state), ve `market_filter` satırında
+  `last` **var** (şema ölçüldü: `askPx, bidPx, last, volUsd24h, rank, …`) → parite başına
+  `get_instruments` + `get_ticker` çifti tamamen kalktı. Evren yenileme turu: 1 filtre + 1
+  enstrüman listesi.
+- **Açık pozisyonu/bekleyen emri olan parite evrenden DÜŞMEZ.** Düşerse `signal_pass`'in parite
+  döngüsü `bars_held`'i ilerletmez, zaman stopu hiç tetiklenmez ve mikro örneklemesi kesilir.
+  `dropped` listesinde "evren dışı ama açık pozisyon/emir var, TUTULDU" olarak loglanır.
+- `market_filter` demo'da 0 satır döndürdüğü için (STATUS #26) auto mod demo'da `config.pairs`'e
+  düşüyor ve sebebi loglanıyor.
+
+### 3) Mikro örnekleme: alt kümeler + ÖLÇÜLEN bütçe
+- `sample_micro` ikiye bölündü: `sample_pair(pair)` (2 istek) ve alt küme seçen `sample_micro()`.
+  Dilimleme `pairs[turn % subsets :: subsets]` — alt kümeler **ayrık**, birleşimi tüm evren
+  (ölçüldü: kesişim boş, birleşim 12/12), hacim sırası alt kümelere dağılıyor.
+- `tools.OkxTools.request_count`: tel üzerinden giden **her deneme** (retry ve CLI yedeği dahil).
+  `tick()` tur başı/sonu farkını alıp konsola basıyor ve `state.turn_requests` + `state.turn_ms`
+  olarak yazıyor; dashboard'da **TUR** kartı (20 sn'yi aşarsa turuncu).
+- **Ölçülen gerçek (12 parite, canlı profil):** normal tur **13–16 istek / 5,1–7,4 sn**,
+  ilk tur (uzlaştırma + rejim) 25 istek / 11,2 sn. 20 sn'lik periyotta rahat pay var.
+  Parite başına örnekleme **40 sn** (2 alt küme), `micro.jsonl`'in her satırında
+  `sample_interval_sec` alanı olarak yazılı.
+- 30 dk medyan penceresi **değişmedi**: `SpreadWindow` zaman tabanlı (deque ts ile kırpılıyor),
+  yani pencere 30 dk kalıyor, içindeki örnek sayısı ~90'dan ~45'e düşüyor.
+
+### 4) Tetik anında TAZE mikro örnek (kullanıcı onaylı, plandan bilinçli ek)
+Alt küme örneklemesi `micro_last[pair]`'i 40 sn'ye kadar bayatlatıyor ve bu veri **iki yerde**
+kullanılıyor: mikro teyit kapısı **ve giriş limit emrinin fiyatı** (`best_bid + 1 tick`, risk
+kapısı kontrol 8). `_handle_candidate` artık mikro kapısından **önce** `sample_pair(pair)`
+çağırıyor; teyit ve fiyat aynı taze defterden geliyor. `strateji.md` §4.3 bunu zaten istiyordu
+("tetik anında tek örnek"), Faz 7'ye kadar 20 sn'lik bayatlık kabul edilebilirdi.
+**Canlıda kanıtlandı (sandbox, dry-run):** LIT-USDT'nin normal ritmi 16:55:07 → 16:55:48 (40 sn),
+arada **16:55:33'te fazladan örnek** var ve `REJECT gate=micro` satırı tam o örneğin OBI'sini
+alıntılıyor (`OBI -0.154 < 0.0`).
+
+### 5) Risk seviyeleri — operatör kontrolü
+- `risk_levels` bloğu; **`balanced` bugünkü `risk:` bloğunun birebir aynısı** → varsayılanda
+  davranış değişmiyor. Kullanıcının yazdığı birimler mevcut config konvansiyonuna çevrildi
+  (`position_pct` kesir, `kill_switch_daily_pct` **işaretli** yüzde, `cooldown_sec` saniye):
+  anahtar adlarını değiştirmek `_risk_gate`'in okuduğu çalışan kapıyı kırardı.
+- `Agent.risk_params()`: `risk:` bloğu + aktif seviyenin **beş** anahtarı (`LEVEL_KEYS`).
+  Strateji eşikleri (`stop_atr_mult`, `min_stop_bps`, `max_stop_bps`, `cooldown_losses`)
+  seviyeden **bağımsız**, tek yerde. `_risk_gate`, `_close_position`'ın cooldown'ı ve evren
+  notional'ı buradan okuyor.
+- **Çözüm sırası control.json → state.json → config varsayılanı** (kullanıcı kararı): operatör
+  seçimi yeniden başlatmayı atlatıyor. `state.risk_level` `to_json` **ve** `load`'a birlikte
+  eklendi — `transport`/`last_tick_ts`'in yazılıp okunmama hatası tekrarlanmadı.
+- **Üç yerdeki 2-anahtar beyaz listesi genişletildi** (`terazi.read_control`,
+  `terazi.write_control`, `dashboard.write_control`). Genişletilmeseydi "Duraklat"a basmak
+  operatörün seviye seçimini **sessizce silerdi** — test T8 tam bunu kovalıyor.
+- `POST /control {"risk_level": …}`: config'deki anahtarlara karşı doğrulanır, **onay istenmez**
+  (yıkıcı eylem değil; açık pozisyonlara dokunmaz). Ajan turun başında görüp
+  `OPERATOR_RISK_LEVEL` satırını düşüyor (`old`/`new` + yeni beş parametre). Tanınmayan değer
+  ajanda `ERROR gate=risk_level` + son geçerli seviyede kalma — **çökmez**.
+- **Seviye evreni etkiliyor** (tasarlanmış, ölçüldü): evren minSz taraması aktif seviyenin
+  notional'ıyla yapılıyor. `aggressive` (%40 → 12 USDT) ZEC-USDT'yi evrene aldı (1,0× minSz),
+  `balanced` (%30 → 9 USDT) onu `sz=0.00783 < minSz=0.01` ile eledi. Seviye değişiminde evren
+  **yeniden taranmıyor**; minSz'ın otoritesi her emirde çalışan risk kapısı kontrol 8'dir.
+- Dashboard: alt çubukta üç düğmeli seçici (aktif pill vurgulu), üst şeritte **SEVİYE** rozeti
+  (temkinli yeşil · dengeli sarı · agresif kırmızı), beş parametre tooltip'te.
+
+### Faz 7.5 sürprizleri (hepsi ölçüm)
+39. **Borsanın 10M üstü USDT evreni 15 parite.** `top_n: 20` bir tavan değil, temenni;
+    bağlayıcı olan hacim tabanı. Yukarıdaki tablo. Evren 10M sınırında tur tur oynuyor.
+40. **`calibrate.py`'nin öz-testi `--target-horizon 24` ile geçmiyordu ve TABLOYU BASTIRMIYORDU.**
+    Test B'nin verisi 8 muma gömülüydü ama ufku `args.target_horizon`'dan alıyordu; 24 ufukta
+    zaman aşımına hiç ulaşılmıyor, `self_test` `SystemExit` atıyor, kalibrasyon sessizce
+    tablosuz bitiyordu. Mum sayısı artık ufuktan türetiliyor; 9 öz-test **8, 12 ve 24 ufkunda**
+    geçiyor. (Mevcut hata; 15m/12 ufkunda görünmezdi.)
+41. **`market_filter` satırında `last` var** — şema docs'ta yoktu, ölçüldü. Parite başına bir
+    `get_ticker` isteğini tamamen kaldırdı. `get_instruments("SPOT")` instId'siz tüm evreni tek
+    istekte veriyor; ikisi birlikte evren yenilemeyi ~45 istekten 2'ye indirdi.
+42. **Üç ayrı `control.json` beyaz listesi** aynı iki anahtarı sabitliyordu (ajan okuma, ajan
+    yazma, dashboard yazma). Yeni bir operatör anahtarı eklemek üç yeri birlikte değiştirmeyi
+    gerektiriyor; biri atlanırsa hata **sessiz** (seviye bir sonraki mod yazımında kaybolur).
+43. **Alt şerit 5 sütuna sabit.** Evren 12 pariteye çıkınca 12 canvas 5 sütunlu tek satır grid'e
+    giriyordu; `body { overflow: hidden }` taşmayı gizliyor (Faz 6 sürprizi 31'in aynısı).
+    Şerit ilk 5 pariteye kırpıldı, başlık "12 pariteden ilk 5" diyor.
+
+### Doğrulama — hepsi gerçek çıktı
+**T1/T2 — auto evren + 5m akışı (sandbox, canlı profil, `--dry-run`, 20 tur):**
+```
+EVREN (açılış, market_filter): 12 parite · ETH, BTC, SOL, XRP, DOGE, HYPE, UNI, BNB, SUI, NEAR, LIT, RAY
+MİKRO BÜTÇE: 12 parite / 6 parite-tur = 2 alt küme · parite başına örnekleme 40 sn
+TUR İSTEĞİ: mikro 12 + bakiye 1 = 13 · sinyal turunda +12 mum +2 rejim = 27
+tur 2: 13 istek / 7.3 sn · mikro 6 parite (alt küme 1/2, parite başına 40 sn)
+```
+`UNIVERSE` satırı hacim sırasını (`{ETH:1, BTC:2, SOL:4, …}`) ve elenenleri sebebiyle taşıyor
+(USDC/USDG `exclude`, ZEC `minSz`). **5m sınırı iki kez işledi** (16:52:08, 16:55:28) ve
+**3 dakika içinde gerçek bir kurulum çıktı** — 5 parite × 15m ile bugün gün boyu sıfırdı:
+```
+16:52:12 SETUP     LIT-USDT  kurulum: BB alt + RSI eşik altı
+16:55:32 CANDIDATE LIT-USDT  tetik geldi, kapılara giriyor
+16:55:33 REJECT    LIT-USDT  gate=micro  OBI -0.154 < 0.0
+```
+**T3 — alt küme ritmi:** BTC `16:52:03 → :52:43 → :53:23 → :54:03 → :54:43 → :55:23` (tam 40 sn),
+alt küme kesişimi **boş**, birleşim 12/12, her satırda `sample_interval_sec=40`.
+**T4 — taze örnek:** yukarıdaki LIT zinciri; `16:55:33` örneği ritmin dışında.
+**T5 — üç seviyenin boyutu (gerçek `_risk_gate`, gerçek enstrüman/bakiye, emir YOK):**
+```
+seviye         %  notional           sz       px   günlük tavan | eşzamanlı
+cautious      20    5.9985     0.058820   101.98  risk_daily_cap 4/4  | risk_concurrent 1/1
+balanced      30    8.9978     0.088231   101.98  risk_daily_cap 8/8  | risk_concurrent 2/2
+aggressive    40   11.9970     0.117641   101.98  risk_daily_cap 12/12| risk_concurrent 3/3
+kill switch: cautious -1.0 · balanced -1.5 · aggressive -2.5
+orders.jsonl hiç oluşmadı.
+```
+**T6 — seviye değişimi:** `POST /control {"risk_level":"aggressive"}` → 16:54:22
+`OPERATOR_RISK_LEVEL balanced → aggressive` + `{position_pct: 0.4, max_concurrent: 3,
+max_daily_trades: 12, kill_switch_daily_pct: -2.5, cooldown_sec: 1800}`, açık pozisyon 0,
+dokunulmadı.
+**T7 — 400 yolu:** `{"risk_level":"yolo"}` → HTTP 400, *"Geçerli: cautious, balanced,
+aggressive. control.json'a hiçbir şey yazılmadı."*, `control.json` **el değmemiş** (`cat` ile).
+**T8 — beyaz liste sızıntısı:** seviye yazıldıktan sonra `{"mode":"pause"}` → dosyada
+`{"mode":"pause","flatten":false,"risk_level":"aggressive"}`, **seviye korundu**.
+**T9 — fixed geri dönüşü + kalıcılık:** `mode: fixed` → `EVREN (açılış, config.pairs): 5 parite`,
+1 alt küme, 20 sn aralık. Yeniden başlatmada `risk seviyesi = aggressive (kaynak: control.json)`,
+`state.json.risk_level=aggressive`.
+**T10 — ekran (Playwright, 1440×900):** `scrollWidth/Height == innerWidth/Height`, **JS hatası
+YOK**, 10 kart tek satırda, 3 seviye düğmesi (aktif vurgulu), 5 mikro canvas.
+Seçici **uçtan uca tıklandı**: "Temkinli" → aktif pill değişti **ve** üst şerit rozeti
+"SEVİYE Temkinli" oldu. `UNIVERSE` satırları mavi rozetle, **TUR 16 istek · 6.7 sn** kartı yerinde.
+**Öz-testler:** `SetupTracker` 9 testi ufuk 8 / 12 / 24'te geçiyor.
+
+### Kalibrasyon — 5m, 12 parite, 2 gün, eşik 36 sabit (`docs/kalibrasyon-5m.md`)
+| | kurulum | tetik | maliyet ✓ | ort hedef bps | ort stop bps |
+|---|---|---|---|---|---|
+| **TOPLAM (12 parite)** | **119** | **84** | **55** | **90,1** | **58,2** |
+En verimli: NEAR 15/13, ZEC 13/6, SUI 12/10, HYPE 12/8. En kısır: BTC 7/4, UNI 8/5, BNB 8/5.
+Günde **~42 tetik**, bunların **%65'i (27/gün)** 45 bps maliyet kapısını geçiyor. Yani yeni
+bağlayıcı kısıt sinyal kıtlığı değil, **günlük işlem tavanı** (4/8/12).
+
+**Tabloda dikkat isteyen bir aritmetik var (öneri değil, ölçüm):** 26 kazanç × 90,1 bps −
+42 kayıp × 58,2 bps = **−102 bps brüt**, üstüne 75 tur × 18 bps komisyon. Ama bu sayılar
+**kapısız**: maliyet kapısı 84 tetiğin 29'unu, mikro kapısı (OBI ≥ 0) ve yargıç daha fazlasını
+eliyor — kalibrasyon bunları uygulamıyor (dosyanın "Sınırlar" bölümü de öyle diyor).
+**Eşik önerilmiyor**; karar kullanıcının.
+
+### Faz 7.5'te bilinçli bırakılanlar / açık işler
+- **`top_n: 20` şu anki hacim tabanıyla ulaşılamaz.** 20 parite isteniyorsa
+  `universe.min_vol_usd_24h: "5000000"` tek satır — likidite kararı, kullanıcıya bırakıldı.
+- **Seviye değişiminde evren yeniden taranmıyor.** `cautious`'a düşülünce minSz'ı artık
+  geçmeyen parite evrende kalır; risk kapısı kontrol 8 onu emir anında reddeder (`WAIT`/`REJECT`
+  satırı düşer), bir sonraki saat başı yenilemesi listeden çıkarır.
+- **Mikro şeridi ilk 5 pariteyi gösteriyor.** 12–20 sparkline için ayrı bir düzen (sayfalama ya
+  da ikinci satır) yapılmadı; `/micro` tüm pariteleri döndürmeye devam ediyor.
+- `signal.bar` değişimi **`state.last_signal_bar_ts`'i sıfırlamıyor**: 15m damgası 5m akışında
+  da geçerli bir ms damgası olduğu için ilk turda yalnız o damgadan yeni olan mumlar işlenir —
+  yeniden başlatmada tek seferlik 1 mumluk gecikme olabilir, veri bozulmaz.
+- Tur istek sayacı **ölçüyor ama frenlemiyor**: rate limit aşılırsa token bucket yok, MCP hatası
+  + mevcut retry/CLI yedeği devreye girer. `max_pairs_per_turn` elle ayarlanan knob.
+- Faz 6/7'nin açık işleri **duruyor**: `config.yaml`'a `llm: ask:` bloğu, dashboard sabitlerinin
+  config'e taşınması, `fee_source="estimated"`ın maker yerine taker oranını kullanması,
+  TP/SL ayrımının `spot_get_algo_orders(--history)` ile kesinleştirilmesi, degraded-start modu,
+  ATK araç sayacı kartı, gün devri (`trade_day`).
+
+### ⚠️ YENİDEN BAŞLATMA — SENDE, TEK SEFER (komut ÇALIŞTIRILMADI)
+Bu restart Faz 7.5'in tamamını canlıya taşır: 5m sinyal, 12–13 parite auto evren, alt küme
+mikro örnekleme, risk seviyeleri. **Önce kontrol:** `config.yaml`'da `signal.bar: 5m`,
+`signal.time_stop_bars: 24`, `universe.mode: auto`, `risk_levels.default: balanced`,
+`llm.enabled: true`, `demo_test.enabled: false`, `rsi_setup_threshold: 36`.
+```bash
+cd /Users/osmancanbozali/Desktop/terazi
+# 1) ajanı temiz durdur (pozisyonlar borsadaki TP/SL ile korunur):
+echo '{"mode":"kill","flatten":false}' > control.json
+#    logs/terazi.out'ta "OPERATÖR KILL: ajan temiz çıkıyor." göründükten sonra:
+# 2) ajanı başlat (açılışta mode=kill bir kerelik tüketilir → run):
+nohup .venv/bin/python -u terazi.py --profile hackathon > logs/terazi.out 2>&1 & disown
+# 3) dashboard da değişti (/control risk_level + /state + index.html) — onu da yenile:
+pkill -f "uvicorn dashboard:app"
+nohup .venv/bin/uvicorn dashboard:app --port 8787 > logs/dashboard.out 2>&1 & disown
+```
+**Başladıktan sonra ilk bakılacaklar:** konsolda `EVREN (açılış, market_filter)` satırındaki
+parite sayısı, `TUR İSTEĞİ` bütçesi, ve ilk turların `tur N: … istek / … sn` süresinin 20 sn'nin
+altında kalması. Dashboard'da **TUR** kartı turuncuya dönerse alt küme çok büyük demektir
+(`micro.max_pairs_per_turn`'ü düşür).
+
 ## Faz 7 — güvenilirlik ve kapanış hazırlığı: TAMAM (12 Eylül, 16:05 +03:00)
 
 **Teslimat:** `tools.py` (CLI yedeği), `terazi.py` (komisyonlu net PnL, gün sonu ayrı eylem, saat

@@ -279,6 +279,10 @@ class OkxTools:
         self._cli_command = cli_command
         self.last_transport = "mcp"  # son çağrının aktarımı; çağıran loglar
         self.fallback_count = 0  # oturum boyunca CLI'ya düşen çağrı sayısı
+        # Oturum boyunca borsaya giden GERÇEK istek sayısı: yeniden denemeler ve CLI yedeği
+        # dahil (rate limit tellere bakar, çağrı sayısına değil). Faz 7.5: tur başına
+        # istek bütçesini ölçmek için `terazi.tick()` turun başı/sonu farkını alıyor.
+        self.request_count = 0
 
     # ---- oturum ----
 
@@ -339,6 +343,7 @@ class OkxTools:
         last_exc: Exception = AssertionError("ulaşılamaz")
         for attempt in range(1, attempts + 1):
             try:
+                self.request_count += 1  # tel üzerinden giden her deneme sayılır
                 out = await self._call_once(tool, args)
                 self.last_transport = "mcp"
                 return out
@@ -353,6 +358,7 @@ class OkxTools:
 
         if self._cli_fallback and tool in CLI_FALLBACK:
             try:
+                self.request_count += 1  # CLI yedeği de borsaya giden bir istektir
                 out = await self._cli_call(tool, args)
             except NoCliMapping:
                 raise last_exc from None

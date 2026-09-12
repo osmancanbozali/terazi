@@ -452,9 +452,12 @@ def self_test(args: argparse.Namespace) -> list[str]:
     check("iptal ufuk tüketmez (7 mum → 3 kurulum)", [setup(i) for i in range(7)],
           [Ev.SETUP, Ev.CANCEL, Ev.SETUP, Ev.CANCEL, Ev.SETUP])
 
-    # B) tetik → 8 mum boyunca ne stop ne hedef → zaman aşımı, sonra yeni kurulum
-    check("tetik + 8 mum ufuk → zaman aşımı",
-          [setup(0), trig(1)] + [flat(i) for i in range(2, 10)] + [setup(10)],
+    # B) tetik → ufuk boyunca ne stop ne hedef → zaman aşımı, sonra yeni kurulum.
+    # Mum sayısı UFUKTAN türetilir: sabit 8 iken `--target-horizon 24` (5m ufku, Faz 7.5)
+    # zaman aşımına hiç ulaşmıyordu ve test tabloyu bastırmıyordu.
+    h = args.target_horizon
+    check(f"tetik + {h} mum ufuk → zaman aşımı",
+          [setup(0), trig(1)] + [flat(i) for i in range(2, 2 + h)] + [setup(2 + h)],
           [Ev.SETUP, Ev.TRIGGER, Ev.TIMEOUT, Ev.SETUP])
 
     # C) hedef (bb_mid=101) önce → KAZANÇ
@@ -620,6 +623,7 @@ async def run(args: argparse.Namespace) -> int:
               "kayıp", "z.aşımı", "z.aşımı çıkış bps", "kazanma %", "ort hedef bps",
               "ort stop bps", "maliyet ✓"]
     table_rows: list[list[str]] = []
+    totals: dict[float, list[Stats]] = {th: [] for th in thresholds}
     for pair in pairs:
         df = frames[pair].iloc[-window_n:]
         bars = [
@@ -628,12 +632,35 @@ async def run(args: argparse.Namespace) -> int:
         ]
         for th in thresholds:
             s = scan(bars, th, args, gate_bps)
+            totals[th].append(s)
             table_rows.append([
                 pair, f"{th:g}", str(s.setups), str(s.triggers), str(s.stop_rejects),
                 str(s.naive_reach), str(s.wins), str(s.losses), str(s.timeouts),
                 fmt(s.avg_timeout_pnl), fmt(s.win_rate), fmt(s.avg_target), fmt(s.avg_stop),
                 str(s.cost_pass),
             ])
+
+    # TOPLAM satırı (Faz 7.5): sayılar toplanır, bps ortalamaları TÜM ÖRNEKLER havuzlanarak
+    # hesaplanır (parite ortalamalarının ortalaması, 1 tetikli pariteyi 40 tetikliyle eşitlerdi).
+    def _pooled(stats: list[Stats], attr: str) -> float | None:
+        vals = [v for s in stats for v in getattr(s, attr)]
+        return sum(vals) / len(vals) if vals else None
+
+    for th in thresholds:
+        ss = totals[th]
+        wins, losses, timeouts = (sum(s.wins for s in ss), sum(s.losses for s in ss),
+                                  sum(s.timeouts for s in ss))
+        resolved = wins + losses + timeouts
+        table_rows.append([
+            f"**TOPLAM ({len(pairs)} parite)**", f"{th:g}",
+            str(sum(s.setups for s in ss)), str(sum(s.triggers for s in ss)),
+            str(sum(s.stop_rejects for s in ss)), str(sum(s.naive_reach for s in ss)),
+            str(wins), str(losses), str(timeouts),
+            fmt(_pooled(ss, "timeout_pnl_bps")),
+            fmt(100.0 * wins / resolved if resolved else None),
+            fmt(_pooled(ss, "target_bps")), fmt(_pooled(ss, "stop_bps")),
+            str(sum(s.cost_pass for s in ss)),
+        ])
 
     now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
     say(f"# Kalibrasyon — RSI eşik taraması")
