@@ -1,9 +1,26 @@
 # STATUS
 
 ## Şu anki faz
-**Faz 0 — Ortam keşfi: TAMAM** (12 Eylül 2026). Sıradaki: Faz 1 — `tools.py` (MCP client + CLI yedek).
+**Faz 1 — `calibrate.py`: TAMAM** (12 Eylül 2026, 08:30 UTC). Tablo `docs/kalibrasyon.md`'de,
+**eşik seçimi kullanıcıda bekliyor.** Sıradaki: Faz 2 — `terazi.py` MVP + seçilen eşikle `config.yaml`.
 
-## Bitenler
+## Faz 1'de bitenler
+- `tools.py` ilk taslağı: `OkxTools` async context manager, üç kat zarfı **tek yerde** (`_call`)
+  soyuyor, `capabilities.demo`'yu her yanıttan okuyup saklıyor ve oturum içinde değişirse hata
+  atıyor. `Candle` pydantic modeli (`ts:int`, OHLCV `Decimal`, `confirm:bool`).
+  Yüzey: `get_candles`, `get_candles_history`, `filter_instruments`, `get_indicator_series`,
+  `get_ticker`, `get_instruments`, `get_orderbook`, `get_trades`, `get_trade_fee`.
+  **Emir aracı yok, CLI yedeği yok, retry yok** (hepsi bilinçli; Faz 2'ye).
+- `calibrate.py`: 3 parite × 3 gün 15m, RSI 28/32/36 taraması. **Emir gönderilmedi.**
+  Ücret canlıdan çekildi: `maker=-0.0008` → `abs`=8,0 bps, maliyet 18,0 bps, kapı 45,0 bps —
+  strateji.md §62 tahmini yine birebir tuttu.
+- Veri sağlamlığı doğrulandı: üç paritede de 407 kapanmış mum, **tekrar eden ts=0, boşluk=0**
+  (sayfa sınırında bile). Analiz penceresi son 288 mum, öncesi ısınma.
+- `SetupTracker` durum makinesi + **7 öz-test** (hepsi geçti). Faz 2'de `terazi.py` bu sınıfa
+  canlı mumu tek tek verecek — backtest ile canlının sapması imkânsız.
+- Tablo `docs/kalibrasyon.md`'ye yazıldı: parite × eşik, kazanç/kayıp/zaman aşımı ayrımıyla.
+
+## Faz 0'da bitenler
 - `okx` CLI 1.4.6 ve `okx-trade-mcp` 1.4.6 kurulu doğrulandı; Pilot: installed (darwin-arm64).
 - Python 3.11.16 kuruldu (sistemde 3.9.6 vardı, `mcp` SDK 3.10+ istiyor). Proje venv'i `.venv/`,
   içinde `mcp`, `pandas 3.0.5`, `pydantic 2.13.5`.
@@ -48,12 +65,40 @@
 10. CLI ile MCP'nin **iç payload'ı birebir aynı**, tek fark zarf (CLI doğrudan dizi döndürüyor).
     Yedek yolu yazmak ucuz: MCP'de iki kat soy, CLI'da hiç soyma.
 
+### Faz 1'de eklenenler
+
+11. **`market_get_candles` `limit` 300'de tavan.** limit=500 istendi, 300 geldi — sessizce kırpıyor.
+    `after=<en eski ts>` ile sayfalama **temiz**: sayfa 2'nin en yenisi tam 1 bar (900000 ms) eski,
+    örtüşme yok. 407 mumda tekrar eden ts = 0.
+12. **`market_filter` `limit` 100'de tavan ve >100 SESSİZ DEĞİL, PATLIYOR:** kod 902
+    "Bind Arguments Validation Failure". limit=200 ile denenip görüldü. 100 ve altı sorunsuz.
+    `minVolUsd24h=10M` ile SPOT/USDT evreni 22 parite; üçümüz de içinde (ETH 1., BTC 2., SOL 4.).
+13. **`market_get_indicator` ve `market_filter` fazladan kat taşıyor.** Genel `payload["data"]["data"]`
+    yetmiyor: filter → `[0]["rows"]`, indicator → `[0]["data"][0]["timeframes"][bar]["indicators"][IND]`.
+    `tools.py` genel soymayı `_call`'da yapıyor, bu iki ekstra katı ilgili metotta.
+14. **`market_get_indicator` `returnList` 100 noktada tavan** (limit=300 istendi, 100 geldi).
+15. **RSI çapraz kontrolü: bizimki DOĞRU.** Ham max fark 2,9 puan görünüyor ama bu bir *ısınma
+    artefaktı*: OKX Wilder'ı kendi 100 mumluk penceresinde tohumluyor, bizde 407 mum var.
+    Fark serinin başında büyük, sonunda yok — BTC'de ilk 10 nokta ort 1,60 → **son 10 nokta 0,004**.
+    Cutler (SMA) varyantı OKX'ten 23,3 puan sapıyor, yani OKX kesin Wilder. Ek çalışma yapılmadı.
+16. **pandas 3.0 `.to_numpy()` SALT OKUNUR dizi döndürüyor.** `delta[0] = 0` → `ValueError:
+    assignment destination is read-only`. `copy=True` şart. pandas 2.x'ten geçerken bu ısırır.
+17. **Markdown tablo başlığında `|Δ|` yazma** — boru işareti sütunu bölüyor, tablo dağılıyor.
+
 ## Ertelenen öneriler
-- Faz 1'de demo profiliyle tek emir atıp iliştirilmiş TP/SL'in `algoId`'sini doğrula (madde 9).
-- `market_get_indicator` ile kendi RSI'ımızı karşılaştırma (urun-mimari.md 3.2'de planlı) Faz 0'da
-  yapılmadı — indikatör hesabı yazıldığında yapılmalı.
+- Faz 2'de demo profiliyle tek emir atıp iliştirilmiş TP/SL'in `algoId`'sini doğrula (madde 9).
+  **Hâlâ açık** — Faz 1 emirsizdi.
+- ~~`market_get_indicator` ile RSI karşılaştırması~~ — Faz 1'de yapıldı (madde 15).
 - `logs/` klasörü boş; git boş klasör tutmuyor. İlk log dosyası yazılınca sorun kalmaz.
+- **`config.yaml` henüz yok.** Kullanıcı eşiği seçince Faz 2'de oluşturulacak; `calibrate.py`'ın
+  argparse varsayılanları (strateji.md §10'dan) ilk içeriği için hazır şablon.
+- **Spread 2 bps varsayıldı, ölçülmedi.** Maliyet kapısı bu sayıya duyarlı. Faz 2'de mikro yapı
+  katmanı 20 sn'de bir orderbook örneklerken gerçek medyan spread ölçülüp kapıya beslenmeli.
+- Tarama komisyonu PnL'e uygulamıyor (kazanç/kayıp saf fiyat hareketi); maliyet kapısı ayrı
+  sütunda. Faz 2'de gerçek PnL hesabı ücreti düşmeli.
+- 3 günlük pencere parite başına 2–7 kurulum veriyor — **örneklem küçük**. Tablo kalibrasyondur,
+  optimizasyon değil; eşiği kazanma yüzdesine göre seçmek aşırı uydurma riski taşır.
 
 ## Canlı ajan durumu
-- Çalışmıyor. Profil: — . Son başlatma: — .
+- Çalışmıyor. Profil: — . Son başlatma: — . (Faz 1 salt okunur geçti; emir gönderilmedi.)
 - Canlı hesap (`hackathon`) bakiyesi: 30 USDT (totalEq 29.9922). Emir gönderilmedi.
