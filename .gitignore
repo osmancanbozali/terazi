@@ -47,3 +47,4 @@ data/
 # Çalışma anı durumu (logs/ gibi; repo'ya girmez)
 state.json
 control.json
+state.*.json

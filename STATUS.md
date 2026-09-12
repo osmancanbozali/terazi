@@ -1,5 +1,51 @@
 # STATUS
 
+## Canlı başlatma düzeltmesi (12 Eylül, 09:40 UTC)
+
+**Sorun:** demo testinden kalan `state.json` canlı ajana taşındı. `day_start_equity` = 100.435
+(demo), `equity` = 29,99 (canlı) → `daily_pnl_pct` **−99,97** → risk kapısının 1. kontrolü
+(kill switch, eşik −%1,5) her adayı reddediyordu. Ajan canlıda çalışıyor ama **hiç işlem
+açamaz** durumdaydı. Ayrıca `logs/*.jsonl` demo satırlarıyla karışıktı (61 karar satırının 46'sı
+demo equity'si taşıyordu; `orders.jsonl`'in 4 satırının tamamı demo SOL emirleriydi).
+
+**Düzeltme — durum artık profil damgalı:**
+- `state.json`'a **`profile`** ve **`demo`** (`capabilities.demo`) alanları yazılıyor.
+- Açılışta damga çalışma anındakiyle uyuşmuyorsa (damga hiç yoksa da) durum **YOK SAYILIR**:
+  `state.<eski_profil>-<ts>.json` olarak arşivlenir, `logs/*.jsonl` →
+  `logs/archive/<eski_profil>-<ts>/` altına taşınır, sıfırdan başlanır. Gün başı equity o anki
+  hesabın **gerçek bakiyesinden** alınır. Uyuşmazlık `decisions.jsonl`'e
+  `ERROR` / `gate: state_profile_mismatch` satırı olarak düşer (temiz loga, arşivlemeden sonra).
+- Durum yüklemesi `__init__`'ten `startup()`'a taşındı: `capabilities.demo` bilinmeden
+  uyuşmazlık tespit edilemez.
+- `control.json` `{"mode":"kill"}` artık döngüyü **temiz kapatıyor** (önceden sadece emirleri
+  durduruyordu, süreç sonsuza dek dönüyordu). Pozisyonlar kapatılmaz — borsadaki TP/SL korur;
+  hepsini kapatmak ayrı eylem (`flatten`). "Ajan asla durmaz" kuralı hatalar için; operatör
+  komutu bunun dışında.
+- Başlatma komutu **`python -u`** oldu (aşağıda). Tamponlama yüzünden `logs/terazi.out` boş kalıyordu.
+- `.gitignore`: `state.*.json` (arşivler).
+
+**Doğrulama:** sahte demo damgalı state ile canlı profil `--dry-run` başlatıldı → arşivleme
+çalıştı (`state.hackathondemo-20260912-123447.json`, `logs/archive/hackathondemo-.../` içinde
+3 jsonl), gün başı equity canlıdan 29,9919 olarak alındı. `kill` yolu dry-run'da temiz çıktı.
+
+**Canlı yeniden başlatıldı** (12:40 +03:00, `python -u`, `--profile hackathon`). İlk karar satırları:
+```
+2026-09-12T12:40:26+03:00  WAIT  equity=29.9919  daily_pnl_pct=0.0  (gün başı equity alındı)
+2026-09-12T12:40:35+03:00  WAIT  equity=29.9919  daily_pnl_pct=0.0  (kurulum yok)
+```
+`state.json` damgası: `profile=hackathon`, `demo=False`, `day_start_equity=29.9919`,
+`kill_switch=False`, `trade_day=2026-09-12`. **Kill switch artık kapalı, risk kapısı geçirgen.**
+
+**Bu düzeltmeyle kapanan yan bulgu:** eski `decisions.jsonl`'deki 4 `ERROR` satırı,
+`ordId` boş kalan başarısız demo emrinin (kod 51094) her turda `spot_get_order` ile
+sorgulanmasından geliyordu (kod 51003). `_check_scode` artık başarısız emri pozisyona/bekleyene
+hiç çevirmediği için bu döngü kökten imkânsız.
+
+**Ertelendi:** gün devri. `trade_day` yazılıyor ama tarih değişince günlük sayaçların
+(`day_start_equity`, `daily_trades`, `consecutive_losses`, `kill_switch`) sıfırlanması
+uygulanmadı — yarışma tek gün olduğu için bugün etkisi yok. Ajan gece yarısını aşarsa
+gün başı equity dünden kalır.
+
 ## Şu anki faz
 **Faz 2 — `terazi.py` + `tools.py` MVP: TAMAM** (12 Eylül 2026, 09:07 UTC).
 Demo'da bir emir uçtan uca geçti: giriş → dolum → `algoId` yakalama → kurtarma → kapatma.
@@ -88,16 +134,20 @@ uzlaştırma döngüsünün bel bağladığı varsayım artık ölçülmüş ger
 - `demo_test` bloğu config'de kapalı duruyor; canlıda `capabilities.demo is not True` iken ajan
   başlamayı reddediyor (bu da test edildi).
 
-### Canlıya geçiş komutu — ÇALIŞTIRILMADI, kullanıcı geçecek
+### Canlı başlatma komutu
 ```bash
 cd /Users/osmancanbozali/Desktop/terazi
 # Önce kontrol: config.yaml'da rsi_setup_threshold 36 ve demo_test.enabled false olmalı.
-.venv/bin/python terazi.py --profile hackathon
+nohup .venv/bin/python -u terazi.py --profile hackathon > logs/terazi.out 2>&1 & disown
 ```
+**`-u` ŞART.** Onsuz stdout tamponlanıyor ve `logs/terazi.out` saatlerce boş kalıyor —
+ajan çalışıyor mu diye bakacak yer yok (12 Eylül'de bu yaşandı).
+
 Bayraklar: `--demo` YOK, `--dry-run` YOK (ikisi de emri engeller). `--max-turns` verilmezse
-sonsuz döngü. Duraklatma/durdurma `control.json` ile: `{"mode":"pause"}` · `{"mode":"kill"}` ·
-`{"mode":"run","flatten":true}`. Güvenlik kapısı canlıda `expected_demo=false` bekler; demo
-MCP'sine yanlışlıkla bağlanılırsa emir gitmez, `decisions.jsonl`'e ERROR düşer.
+sonsuz döngü. Kontrol `control.json` ile: `{"mode":"pause"}` (veri devam, emir yok) ·
+`{"mode":"kill"}` (**ajan temiz çıkar**, pozisyonlar borsadaki TP/SL ile korunur) ·
+`{"mode":"run","flatten":true}` (hepsini kapat). Güvenlik kapısı canlıda `expected_demo=false`
+bekler; demo MCP'sine yanlışlıkla bağlanılırsa emir gitmez, `decisions.jsonl`'e ERROR düşer.
 
 ## Faz 2 ön işi — zaman aşımı çıkış sütunu (12 Eylül, 08:42 UTC)
 `calibrate.py`'ye tek sütun eklendi: **z.aşımı çıkış bps** — zaman aşımına düşen tetiklerde
@@ -212,8 +262,10 @@ Eşik seçimi Faz 2'de yapıldı: **36** (sinyal sıklığına göre), `config.y
   optimizasyon değil; eşiği kazanma yüzdesine göre seçmek aşırı uydurma riski taşır.
 
 ## Canlı ajan durumu
-- **Çalışmıyor.** Profil: — . Son başlatma: — . Canlıya **hiç emir gönderilmedi**
-  (Faz 2 canlı testleri `--dry-run` ile geçti; `orders.jsonl`'de canlı satır yok).
-- Canlı hesap (`hackathon`) bakiyesi: 30 USDT (totalEq 29.9925).
+- **ÇALIŞIYOR.** Profil: `hackathon` (demo=False). Son başlatma: **12 Eylül 12:40 +03:00**,
+  `nohup .venv/bin/python -u terazi.py --profile hackathon > logs/terazi.out 2>&1 &`.
+  Canlıya **henüz emir gönderilmedi** (`orders.jsonl` boş).
+- Canlı hesap (`hackathon`) bakiyesi: 30 USDT (totalEq 29.9919 = gün başı tabanı).
+- Durdurmak için: `echo '{"mode":"kill","flatten":false}' > control.json` (ajan temiz çıkar).
 - Demo hesap (`hackathondemo`): 1 emir atıldı ve kapatıldı. SOL bakiyesi toz seviyesinde
   (1.11e-7), pending algo emri 0 — açık pozisyon kalmadı.

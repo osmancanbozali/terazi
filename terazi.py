@@ -320,6 +320,9 @@ class PendingOrder:
 
 @dataclass
 class State:
+    # Profil damgası: bu durumun HANGİ hesaba ait olduğu. Uyuşmazlık tespiti buna bakar.
+    profile: str = ""
+    demo: bool | None = None
     positions: list[Position] = field(default_factory=list)
     pending: list[PendingOrder] = field(default_factory=list)
     day_start_equity: Decimal | None = None
@@ -336,6 +339,8 @@ class State:
 
     def to_json(self) -> dict[str, Any]:
         return {
+            "profile": self.profile,
+            "demo": self.demo,
             "positions": [p.to_json() for p in self.positions],
             "pending": [p.to_json() for p in self.pending],
             "day_start_equity": None if self.day_start_equity is None else str(self.day_start_equity),
@@ -357,6 +362,8 @@ class State:
             return cls()
         d = json.loads(STATE.read_text(encoding="utf-8"))
         st = cls(
+            profile=d.get("profile", ""),
+            demo=d.get("demo"),
             positions=[Position.from_json(p) for p in d.get("positions", [])],
             pending=[PendingOrder.from_json(p) for p in d.get("pending", [])],
             equity=Decimal(d.get("equity", "0")),
@@ -375,6 +382,51 @@ class State:
 
     def save(self) -> None:
         STATE.write_text(json.dumps(self.to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def archive_if_profile_changed(profile: str, demo: bool | None) -> dict[str, Any] | None:
+    """Profil/demo değiştiyse `state.json`'ı ve `logs/*.jsonl`'i arşivle, sıfırdan başla.
+
+    NEDEN: demo testinin gün başı equity'si (≈100.000 USDT) canlı hesaba (30 USDT) taşınırsa
+    `daily_pnl_pct` −99,97 olur ve kill switch fiilen kilitlenir — ajan canlıda hiç işlem
+    açamaz. Aynı şekilde demo emirleri canlı `orders.jsonl`'e karışırsa karar günlüğü yalan söyler.
+    Bu yüzden uyuşmazlık bir hata değil, TEMİZLİK TETİĞİ'dir: eskisi saklanır, yenisi temiz başlar.
+
+    Damga yoksa (Faz 2 öncesi state) uyuşmazlık sayılır — güvenilmeyen durum taşınmaz.
+    Döndürdüğü sözlük `decisions.jsonl`'e loglanır; None = temizlik gerekmedi.
+    """
+    if not STATE.exists():
+        return None
+    try:
+        raw = json.loads(STATE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        raw = {}
+    old_profile = raw.get("profile") or ""
+    old_demo = raw.get("demo")
+    if old_profile == profile and old_demo == demo:
+        return None  # aynı hesap, durum taşınır
+
+    label = old_profile or ("demo" if old_demo else "unknown")
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    state_archive = Path(f"state.{label}-{ts}.json")
+    STATE.rename(state_archive)
+
+    log_archive = LOGS / "archive" / f"{label}-{ts}"
+    moved: list[str] = []
+    for path in sorted(LOGS.glob("*.jsonl")):
+        log_archive.mkdir(parents=True, exist_ok=True)
+        path.rename(log_archive / path.name)
+        moved.append(path.name)
+
+    return {
+        "old_profile": old_profile or "(damgasız)",
+        "old_demo": old_demo,
+        "new_profile": profile,
+        "new_demo": demo,
+        "state_archive": str(state_archive),
+        "log_archive": str(log_archive) if moved else None,
+        "logs_moved": moved,
+    }
 
 
 def read_control() -> dict[str, Any]:
@@ -401,7 +453,8 @@ class Agent:
         self.t = tools
         self.args = args
         self.tz = ZoneInfo(cfg.execution.timezone)
-        self.state = State.load()
+        # Durum `startup()` içinde yüklenir: profil/demo uyuşmazlığı önce arşivlenmeli.
+        self.state = State()
         self.regime = Regime()
         self.pairs: list[str] = []
         self.inst: dict[str, dict[str, Decimal]] = {}  # pair → tickSz/lotSz/minSz
@@ -454,6 +507,29 @@ class Agent:
             print(f"UYARI: demo_test AÇIK — {self.cfg.demo_test.pair} için sentetik aday "
                   f"üretilecek (hiçbir kapı atlanmıyor).")
 
+        # Profil/demo uyuşmazlığı → eski durumu ve logları arşivle. `capabilities.demo`
+        # bilinmeden yapılamaz, bu yüzden durum BURADA yüklenir (__init__'te değil).
+        archived = archive_if_profile_changed(self.t.profile, caps_demo)
+        self.state = State.load()
+        self.state.profile = self.t.profile
+        self.state.demo = caps_demo
+        if archived:
+            print(f"PROFİL DEĞİŞTİ: {archived['old_profile']} (demo={archived['old_demo']}) → "
+                  f"{self.t.profile} (demo={caps_demo})")
+            print(f"  durum arşivi: {archived['state_archive']}")
+            if archived["log_archive"]:
+                print(f"  log arşivi:   {archived['log_archive']} "
+                      f"({', '.join(archived['logs_moved'])})")
+            self.decide(
+                "ERROR", gate="state_profile_mismatch",
+                reason=f"state.json/loglar {archived['old_profile']} (demo={archived['old_demo']}) "
+                       f"hesabına aitti, çalışma anı {self.t.profile} (demo={caps_demo}). "
+                       f"Durum YOK SAYILDI, sıfırdan başlanıyor; gün başı equity canlı "
+                       f"bakiyeden alınacak.",
+                state_archive=archived["state_archive"], log_archive=archived["log_archive"],
+                logs_moved=archived["logs_moved"],
+            )
+
         # Evren doğrulaması gerçek boyutla çalışsın diye equity ÖNCE okunur.
         await self.refresh_equity()
         await self._validate_universe()
@@ -476,8 +552,14 @@ class Agent:
 
         await self.refresh_equity()
         if self.state.day_start_equity is None:
+            # Gün başı equity HER ZAMAN o anki hesabın gerçek bakiyesinden gelir.
             self.state.day_start_equity = self.state.equity
-            print(f"gün başı equity = {self.state.equity}")
+            self.state.trade_day = datetime.now(tz=self.tz).strftime("%Y-%m-%d")
+            self.state.daily_pnl_pct = 0.0
+            print(f"gün başı equity = {self.state.equity} (profil {self.t.profile})")
+            self.decide("WAIT", gate="day_start",
+                        reason=f"gün başı equity {self.state.equity} olarak {self.t.profile} "
+                               f"bakiyesinden alındı; günlük PnL sıfırlandı")
         # Borsa kaynak gerçek: state.json ne derse desin önce uzlaştır.
         await self.reconcile(startup=True)
 
@@ -1171,10 +1253,25 @@ class Agent:
         mode = control["mode"]
         orders_allowed = mode == "run"
 
-        if mode != getattr(self, "_last_mode", "run"):
+        # kill kendi (daha zengin) satırını aşağıda yazıyor; burada tekrarlamıyoruz.
+        if mode != getattr(self, "_last_mode", "run") and mode != "kill":
             self.decide(f"OPERATOR_{mode.upper()}", reason=f"control.json mode={mode}")
             print(f"OPERATÖR: mode={mode}")
         self._last_mode = mode
+
+        if mode == "kill":
+            # Acil Durdur: döngü TEMİZ çıkar. Pozisyonlar kapatılmaz — borsadaki TP/SL onları
+            # korumaya devam eder; hepsini kapatmak ayrı bir eylem (flatten).
+            # "Ajan asla durmaz" kuralı HATALAR için; operatör komutu bunun dışındadır.
+            self.state.kill_switch = True
+            self.state.last_turn_ms = now_ms()
+            self.state.save()
+            self.decide("OPERATOR_KILL",
+                        reason=f"acil durdur: döngü sonlandırılıyor, {len(self.state.positions)} "
+                               f"pozisyon borsadaki TP/SL ile korunuyor")
+            print("OPERATÖR KILL: ajan temiz çıkıyor.")
+            self._stop_requested = True
+            return
 
         await self.refresh_equity()
         await self.sample_micro()
@@ -1233,6 +1330,8 @@ class Agent:
                 await asyncio.sleep(self.cfg.execution.error_backoff_sec)
                 continue
 
+            if getattr(self, "_stop_requested", False):
+                return 0  # control.json mode=kill
             if self.args.max_turns and self.turn >= self.args.max_turns:
                 print(f"--max-turns {self.args.max_turns} doldu, temiz çıkış.")
                 return 0
