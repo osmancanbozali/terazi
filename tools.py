@@ -1,16 +1,25 @@
 """Terazi — OKX ATK MCP istemcisi (ince katman).
 
-Faz 1 kapsamı: sadece `market_*` ve `account_get_trade_fee`.
+Faz 2 kapsamı: `market_*`, `account_*` ve `spot_*` (emir yüzeyi dahil).
+
+Retry politikası — CLAUDE.md mutlak yasağı koda gömülü:
+  - VERİ çağrıları: 2 deneme, üssel bekleme.
+  - EMİR çağrıları (`ORDER_TOOLS`): TEK deneme. `_call` bunu assert ile zorlar;
+    çift emir riski yüzünden yeniden deneme yasak.
+
+Emir güvenlik kapısı: her `spot_place_order` öncesi yanıtlardan okunan `capabilities.demo`,
+`expected_demo` ile karşılaştırılır. Eşleşmezse emir GÖNDERİLMEZ, `SafetyGateError` atılır.
+`dry_run=True` ise emir araçları MCP'ye hiç gitmez.
+
 Bu dosyada BİLEREK yok:
-  - emir aracı (`spot_*`) — emre giden yol risk kapısından geçer, o Faz 2'de
-  - CLI yedeği — Faz 1'de MCP-only
-  - otomatik retry — tek deneme, hata yukarı fırlar (CLAUDE.md mutlak yasak)
+  - CLI yedeği — Faz 7 (docs/urun-mimari.md §3.2)
 
 Araç adları `docs/mcp-araclari.md`'den alınmıştır; tahmin edilmemiştir.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import AsyncExitStack
 from decimal import Decimal, InvalidOperation
@@ -36,9 +45,31 @@ BAR_MS: dict[str, int] = {
     "1D": 86_400_000,
 }
 
-# market_get_candles tek çağrıda en fazla bunu döndürüyor (Faz 1'de ölçüldü:
-# limit=500 istendi, 300 satır geldi). Fazlası için `after` ile sayfala.
+# Bilinen API tavanları (Faz 1'de ÖLÇÜLDÜ, tahmin değil):
+#   candles: limit=500 istendi, 300 satır geldi — sessizce kırpıyor.
+#   filter:  limit=200 → kod 902 "Bind Arguments Validation Failure" — PATLIYOR.
+#   indicator: returnList limit=300 istendi, 100 nokta geldi.
 CANDLES_MAX_LIMIT = 300
+FILTER_MAX_LIMIT = 100
+INDICATOR_MAX_LIMIT = 100
+
+# Emir araçları: bunlarda YENİDEN DENEME YOK (çift emir riski). `_call` assert ile zorlar.
+ORDER_TOOLS: frozenset[str] = frozenset(
+    {
+        "spot_place_order",
+        "spot_cancel_order",
+        "spot_amend_order",
+        "spot_place_algo_order",
+        "spot_amend_algo_order",
+        "spot_cancel_algo_order",
+        "spot_batch_orders",
+        "spot_batch_amend",
+        "spot_batch_cancel",
+    }
+)
+
+DATA_ATTEMPTS = 2  # veri çağrısı deneme sayısı
+RETRY_BACKOFF_SEC = 0.5  # 1. hata sonrası bekleme; her denemede ikiye katlanır
 
 # Sayısala çevrilmeyecek alanlar: kimlikler, zaman damgaları, enum'lar.
 # Bunlar rakamdan ibaret olsa bile string kalmalı (ts'i Decimal yapmak indekslemeyi bozar).
@@ -56,12 +87,32 @@ KEEP_STR: frozenset[str] = frozenset(
 
 
 class OkxToolError(RuntimeError):
-    """Bir MCP aracı hata döndürdü. Retry yok; çağıran karar verir."""
+    """Bir MCP aracı hata döndürdü. Emir araçlarında retry yok; çağıran karar verir."""
 
     def __init__(self, tool: str, detail: Any) -> None:
         self.tool = tool
         self.detail = detail
         super().__init__(f"{tool}: {detail!r}")
+
+
+def _check_scode(tool: str, row: dict[str, Any]) -> dict[str, Any]:
+    """Emir yanıtındaki `sCode`'u doğrula.
+
+    TUZAK (Faz 2'de yaşandı): emir REDDEDİLSE BİLE dış zarf `ok: true` gelir ve
+    `payload["data"]["data"][0]` içinde `sCode` sıfırdan farklı olur (`ordId` boş string).
+    Bunu kontrol etmezsek başarısız emri başarılı sayar, olmayan pozisyonu takip ederiz.
+    """
+    code = str(row.get("sCode", "0"))
+    if code not in ("0", ""):
+        raise OkxToolError(tool, {"sCode": code, "sMsg": row.get("sMsg"), "row": row})
+    return row
+
+
+class SafetyGateError(RuntimeError):
+    """Emir güvenlik kapısı emri durdurdu: `capabilities.demo` != `expected_demo`.
+
+    Emir MCP'ye hiç gitmedi. Çağıran bunu `decisions.jsonl`'e ERROR olarak yazmalı.
+    """
 
 
 class Candle(BaseModel):
@@ -133,6 +184,8 @@ class OkxTools:
         modules: str = DEFAULT_MODULES,
         demo: bool = False,
         command: str = "okx-trade-mcp",
+        expected_demo: bool | None = None,
+        dry_run: bool = False,
     ) -> None:
         args = ["--profile", profile, "--modules", modules]
         if demo:
@@ -142,6 +195,9 @@ class OkxTools:
         self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
         self._demo: bool | None = None
+        # Güvenlik kapısı: None = kapı kapalı, emir aracı çağrılırsa reddedilir.
+        self._expected_demo = expected_demo
+        self._dry_run = dry_run
 
     # ---- oturum ----
 
@@ -176,17 +232,38 @@ class OkxTools:
         """
         return self._demo
 
+    @property
+    def dry_run(self) -> bool:
+        return self._dry_run
+
     # ---- tek soyma noktası ----
 
-    async def _call(self, tool: str, args: dict[str, Any]) -> Any:
+    async def _call(self, tool: str, args: dict[str, Any], attempts: int = DATA_ATTEMPTS) -> Any:
         """Aracı çağır, üç kat zarfı soy, `capabilities.demo`'yu sakla.
 
         Zarf: {tool, ok, data:{endpoint, requestTime, data:<GERÇEK>}, capabilities, timestamp}
-        Retry YOK. Hata → OkxToolError.
+
+        `attempts`: veri çağrıları için 2 (üssel bekleme). EMİR araçları için 1 olmak ZORUNDA —
+        assert bunu zorlar, yorumla bırakılmaz (CLAUDE.md: emir çağrılarında retry YOK).
         """
+        if tool in ORDER_TOOLS:
+            assert attempts == 1, f"{tool}: emir çağrısında yeniden deneme yasak (attempts={attempts})"
         if self._session is None:
             raise RuntimeError("OkxTools oturumu açık değil; 'async with' içinde kullan.")
 
+        delay = RETRY_BACKOFF_SEC
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._call_once(tool, args)
+            except OkxToolError:
+                if attempt == attempts:
+                    raise
+                await asyncio.sleep(delay)
+                delay *= 2
+        raise AssertionError("ulaşılamaz")
+
+    async def _call_once(self, tool: str, args: dict[str, Any]) -> Any:
+        assert self._session is not None
         result = await self._session.call_tool(tool, args)  # SDK snake_case
         if not result.content:
             raise OkxToolError(tool, "boş yanıt (content yok)")
@@ -205,6 +282,26 @@ class OkxTools:
             self._demo = seen
 
         return payload["data"]["data"]
+
+    # ---- emir güvenlik kapısı ----
+
+    async def _gate(self, inst_id: str) -> None:
+        """Emir öncesi tek kapı. Geçmezse emir MCP'ye HİÇ gitmez.
+
+        `capabilities.demo` profil adına değil gerçek yanıta dayanır (docs/mcp-araclari.md §7).
+        Henüz hiç yanıt görülmediyse önce ucuz bir veri çağrısıyla doldurulur.
+        """
+        if self._expected_demo is None:
+            raise SafetyGateError(
+                "expected_demo verilmedi; emir yolu kapalı. OkxTools(expected_demo=...) ile aç."
+            )
+        if self._demo is None:
+            await self.get_ticker(inst_id)  # capabilities.demo'yu doldurur
+        if self._demo != self._expected_demo:
+            raise SafetyGateError(
+                f"EMİR DURDURULDU: capabilities.demo={self._demo} != expected_demo="
+                f"{self._expected_demo} (profil={self._profile})"
+            )
 
     # ---- market ----
 
@@ -245,7 +342,12 @@ class OkxTools:
         return [by_ts[ts] for ts in sorted(by_ts)][-need:]
 
     async def filter_instruments(self, **kwargs: Any) -> list[dict[str, Any]]:
-        """`market_filter`. Yanıt fazladan bir kat derin: [{"rows": [...]}]."""
+        """`market_filter`. Yanıt fazladan bir kat derin: [{"rows": [...]}].
+
+        `limit` 100'de tavan — 100'ün üstü kod 902 ile PATLIYOR, sessiz kırpma yok.
+        """
+        if "limit" in kwargs and kwargs["limit"] is not None:
+            kwargs["limit"] = min(int(kwargs["limit"]), FILTER_MAX_LIMIT)
         data = await self._call("market_filter", kwargs)
         rows = data[0].get("rows", []) if data else []
         return [_decimalize(r) for r in rows]
@@ -269,7 +371,7 @@ class OkxTools:
             "indicator": indicator,
             "bar": bar,
             "returnList": True,
-            "limit": limit,
+            "limit": min(limit, INDICATOR_MAX_LIMIT),  # returnList 100 noktada tavan
         }
         if params:
             args["params"] = params
@@ -304,14 +406,36 @@ class OkxTools:
         return [_decimalize(r) for r in rows]
 
     async def get_orderbook(self, inst_id: str, sz: int = 5) -> dict[str, Any]:
+        """Emir defteri. Her kademe 4 elemanlı dizi: [fiyat, miktar, "0", emir_sayısı]."""
         rows = await self._call("market_get_orderbook", {"instId": inst_id, "sz": sz})
         return _decimalize(rows[0])
 
     async def get_trades(self, inst_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Son işlemler, en yeniden eskiye. `side` = agresörün (taker'ın) yönü."""
         rows = await self._call("market_get_trades", {"instId": inst_id, "limit": limit})
         return [_decimalize(r) for r in rows]
 
     # ---- account ----
+
+    async def get_balance(self, ccy: str | None = None) -> dict[str, Any]:
+        """Bakiye. `availEq` NAKİT HESAPTA BOŞ STRING — kullanılabilir için `availBal` oku."""
+        args: dict[str, Any] = {}
+        if ccy:
+            args["ccy"] = ccy
+        rows = await self._call("account_get_balance", args)
+        return _decimalize(rows[0])
+
+    async def get_avail_bal(self, ccy: str = "USDT") -> Decimal:
+        """`details[]` içinden tek para biriminin kullanılabilir bakiyesi (`availBal`).
+
+        `availEq` boş string geldiği için ona bakılmaz (docs/mcp-araclari.md §4.3).
+        """
+        bal = await self.get_balance()
+        for row in bal.get("details") or []:
+            if row.get("ccy") == ccy:
+                raw = row.get("availBal")
+                return Decimal(str(raw)) if raw not in ("", None) else Decimal(0)
+        return Decimal(0)
 
     async def get_trade_fee(
         self, inst_type: str = "SPOT", inst_id: str | None = None
@@ -325,3 +449,146 @@ class OkxTools:
             args["instId"] = inst_id
         rows = await self._call("account_get_trade_fee", args)
         return _decimalize(rows[0])
+
+    # ---- spot: EMİR YOLU ----
+    #
+    # Buradaki her metot TEK deneme (attempts=1). Yeniden deneme yok, çünkü ikinci deneme
+    # birincinin borsaya ulaşıp ulaşmadığını bilemez → çift emir riski.
+    # `place_order` ayrıca güvenlik kapısından geçer; okuma araçları (orders/fills/algo) geçmez.
+
+    async def place_order(
+        self,
+        inst_id: str,
+        side: str,
+        ord_type: str,
+        sz: str,
+        px: str | None = None,
+        td_mode: str = "cash",
+        tgt_ccy: str | None = None,
+        cl_ord_id: str | None = None,
+        tp_trigger_px: str | None = None,
+        tp_ord_px: str | None = None,
+        tp_ord_kind: str | None = None,
+        sl_trigger_px: str | None = None,
+        sl_ord_px: str | None = None,
+    ) -> dict[str, Any]:
+        """`spot_place_order`. TEK DENEME + güvenlik kapısı + dry-run.
+
+        Tüm fiyat/miktar alanları ÇAĞIRAN tarafından tickSz/lotSz'a yuvarlanmış string olmalı;
+        burada yuvarlama yapılmaz (sessiz düzeltme, sessiz hatadır).
+
+        `dry_run` ise MCP'ye hiç gitmez; `{"dry_run": True, "args": ...}` döner.
+        Kapı geçmezse `SafetyGateError` — emir gönderilmez.
+        """
+        await self._gate(inst_id)
+
+        args: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": ord_type,
+            "sz": sz,
+        }
+        optional = {
+            "px": px,
+            "tgtCcy": tgt_ccy,
+            "clOrdId": cl_ord_id,
+            "tpTriggerPx": tp_trigger_px,
+            "tpOrdPx": tp_ord_px,
+            "tpOrdKind": tp_ord_kind,
+            "slTriggerPx": sl_trigger_px,
+            "slOrdPx": sl_ord_px,
+        }
+        args.update({k: v for k, v in optional.items() if v is not None})
+
+        if self._dry_run:
+            return {"dry_run": True, "args": args}
+
+        rows = await self._call("spot_place_order", args, attempts=1)
+        return _check_scode("spot_place_order", _decimalize(rows[0])) if rows else {}
+
+    async def cancel_order(
+        self, inst_id: str, ord_id: str | None = None, cl_ord_id: str | None = None
+    ) -> dict[str, Any]:
+        """`spot_cancel_order`. TEK DENEME."""
+        args: dict[str, Any] = {"instId": inst_id}
+        if ord_id:
+            args["ordId"] = ord_id
+        if cl_ord_id:
+            args["clOrdId"] = cl_ord_id
+        if self._dry_run:
+            return {"dry_run": True, "args": args}
+        rows = await self._call("spot_cancel_order", args, attempts=1)
+        return _check_scode("spot_cancel_order", _decimalize(rows[0])) if rows else {}
+
+    async def cancel_algo_order(self, inst_id: str, algo_id: str) -> dict[str, Any]:
+        """`spot_cancel_algo_order` — iliştirilmiş TP/SL'i iptal eder. TEK DENEME.
+
+        Zaman stopu ve flatten bu çağrıyı yapmadan market sell atmamalı: aksi halde
+        TP/SL borsada yaşamaya devam eder ve elimizde olmayan miktarı satmaya çalışır.
+        """
+        args = {"instId": inst_id, "algoId": algo_id}
+        if self._dry_run:
+            return {"dry_run": True, "args": args}
+        rows = await self._call("spot_cancel_algo_order", args, attempts=1)
+        return _check_scode("spot_cancel_algo_order", _decimalize(rows[0])) if rows else {}
+
+    async def amend_algo_order(self, inst_id: str, algo_id: str, **fields: Any) -> dict[str, Any]:
+        """`spot_amend_algo_order`. TEK DENEME. Alanlar: newSz/newTpTriggerPx/newTpOrdPx/
+        newSlTriggerPx/newSlOrdPx (docs/mcp-araclari.md §6)."""
+        args: dict[str, Any] = {"instId": inst_id, "algoId": algo_id}
+        args.update({k: v for k, v in fields.items() if v is not None})
+        if self._dry_run:
+            return {"dry_run": True, "args": args}
+        rows = await self._call("spot_amend_algo_order", args, attempts=1)
+        return _check_scode("spot_amend_algo_order", _decimalize(rows[0])) if rows else {}
+
+    # ---- spot: okuma (uzlaştırma) ----
+
+    async def get_orders(
+        self, status: str = "open", inst_id: str | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        args: dict[str, Any] = {"status": status}
+        if inst_id:
+            args["instId"] = inst_id
+        if limit:
+            args["limit"] = limit
+        rows = await self._call("spot_get_orders", args)
+        return [_decimalize(r) for r in rows]
+
+    async def get_order(
+        self, inst_id: str, ord_id: str | None = None, cl_ord_id: str | None = None
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {"instId": inst_id}
+        if ord_id:
+            args["ordId"] = ord_id
+        if cl_ord_id:
+            args["clOrdId"] = cl_ord_id
+        rows = await self._call("spot_get_order", args)
+        return _decimalize(rows[0]) if rows else {}
+
+    async def get_fills(
+        self, inst_id: str | None = None, ord_id: str | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Dolumlar. Kısmi dolum için gerçek miktar BURADAN gelir, emirden değil."""
+        args: dict[str, Any] = {}
+        if inst_id:
+            args["instId"] = inst_id
+        if ord_id:
+            args["ordId"] = ord_id
+        if limit:
+            args["limit"] = limit
+        rows = await self._call("spot_get_fills", args)
+        return [_decimalize(r) for r in rows]
+
+    async def get_algo_orders(
+        self, status: str = "pending", inst_id: str | None = None, ord_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        """İliştirilmiş TP/SL burada `algoId` ile görünür — pozisyonun çıkış emri kimliği."""
+        args: dict[str, Any] = {"status": status}
+        if inst_id:
+            args["instId"] = inst_id
+        if ord_type:
+            args["ordType"] = ord_type
+        rows = await self._call("spot_get_algo_orders", args)
+        return [_decimalize(r) for r in rows]

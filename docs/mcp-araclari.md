@@ -385,14 +385,42 @@ ve `okx spot algo amend` açıklaması:
 
 Uçlar: `spot_get_algo_orders` → `GET /api/v5/trade/orders-algo-pending` (boş hesapta `data: []` döndü).
 
-**Doğrulanmamış kısım:** iliştirilmiş TP/SL'in `spot algo orders` listesinde gerçekten bir `algoId`
-ile görünüp görünmediği **emir göndermeden test edilemedi** (bu görevde emir yasaktı).
-Faz 1'de `--profile hackathondemo --demo` ile tek emir atılıp `algoId`'nin döndüğü doğrulanmalı.
-Uzlaştırma döngüsü (`her 60 sn`) buna bel bağlayacak.
+**DOĞRULANDI (Faz 2, 12 Eylül 12:01 UTC+3, `hackathondemo --demo` ile tek emir):** iliştirilmiş
+TP/SL `spot_get_algo_orders(status="pending")` listesinde gerçekten `algoId` ile görünüyor.
+Gözlenen satır:
 
-Ayrıca not: `spot_place_order.tpOrdPx = "-1"` → piyasa emriyle çıkış demek. `tpOrdKind: "limit"`
-ile hedefi **maker** limit satış yapabiliyoruz — strateji.md §143'ün "hedef BB_mid, limit satış (maker)"
-gereksinimi tek çağrıda karşılanıyor, ayrı algo emri gerekmiyor.
+```json
+{"algoId":"3915846276696993797","instId":"SOL-USDT","ordType":"oco","side":"sell","state":"live",
+ "sz":"0.117771","tpTriggerPx":"102.86","tpOrdPx":"102.86","slTriggerPx":"100.82","slOrdPx":"100.8"}
+```
+
+Notlar (hepsi ölçüm):
+- Tip **`oco`** geliyor (TP+SL çifti tek algo emri). `ordType` filtresi kullanacaksan `oco` ara.
+- `algoId` ana emrin `ordId`'sinden FARKLI ve ondan bağımsız yaşıyor.
+- **`sz` dolumdan AZ:** dolum 0.117889 SOL, algo emri 0.117771. OKX alış komisyonunu **baz
+  paradan** kesiyor. Çıkışta `dolum miktarı` kadar satmaya kalkarsan bakiye yetmezliğine
+  düşersin — satış miktarını gerçek baz bakiyeyle sınırla.
+
+**DÜZELTME — `tpOrdKind: "limit"` SPOT'TA ÇALIŞMIYOR.** Bu doküman önceden CLI yardım metninden
+"hedefi maker limit satış yapabiliyoruz" çıkarımını yapmıştı; **bu çıkarım yanlıştı ve ölçümle
+çürütüldü.** `tpOrdKind: "limit"` ile gönderilen emir şu yanıtı verdi:
+
+```json
+{"ordId":"","sCode":"51094","sMsg":"You can't place TP limit orders in spot, margin, or options trading."}
+```
+
+`tpOrdKind` hiç gönderilmediğinde emir sorunsuz geçiyor ve `tpOrdPx` sabit fiyat olarak duruyor
+(yukarıdaki `oco` satırı o çağrının sonucu). `tpOrdPx = "-1"` ise piyasa emriyle çıkış demek.
+
+**TUZAK — emir reddi `ok: true` içinde saklanıyor.** Emir başarısız olsa bile dış zarf
+`"ok": true` geliyor; hata `payload["data"]["data"][0]["sCode"]` içinde ve `ordId` boş string.
+`sCode`'u kontrol etmezsen başarısız emri başarılı sayar, olmayan pozisyonu takip edersin.
+`tools.py` bunu `_check_scode` ile tek yerde zorluyor.
+
+**TUZAK — `market_filter` DEMO ORTAMINDA BOŞ.** `--profile hackathondemo --demo` ile
+`market_filter` **filtresiz bile 0 satır** döndürüyor (canlıda 22 satır). Canlı piyasa tarama
+aracı demo hesaba bağlı değil. `market_get_instruments` ve `market_get_ticker` demo'da normal
+çalışıyor — hacim doğrulaması demo'da `ticker.volCcy24h`'ten yapılmalı.
 
 ---
 

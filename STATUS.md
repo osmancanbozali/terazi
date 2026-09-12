@@ -1,8 +1,105 @@
 # STATUS
 
 ## Şu anki faz
-**Faz 1 — `calibrate.py`: TAMAM** (12 Eylül 2026, 08:30 UTC). Tablo `docs/kalibrasyon.md`'de,
-**eşik seçimi kullanıcıda bekliyor.** Sıradaki: Faz 2 — `terazi.py` MVP + seçilen eşikle `config.yaml`.
+**Faz 2 — `terazi.py` + `tools.py` MVP: TAMAM** (12 Eylül 2026, 09:07 UTC).
+Demo'da bir emir uçtan uca geçti: giriş → dolum → `algoId` yakalama → kurtarma → kapatma.
+**Canlıya emir gönderilmedi.** Sıradaki: Faz 3 — canlı (judge off).
+
+### (b) testinin cevabı: EVET, algoId iliştirilmiş TP/SL listesinde görünüyor
+`docs/mcp-araclari.md` §6 madde 9 **kapandı.** `spot_get_algo_orders(status="pending")`:
+
+```json
+{"algoId":"3915846276696993797","instId":"SOL-USDT","ordType":"oco","side":"sell","state":"live",
+ "sz":"0.117771","tpTriggerPx":"102.86","tpOrdPx":"102.86","slTriggerPx":"100.82","slOrdPx":"100.8"}
+```
+
+Tip `oco` (TP+SL tek algo emri), `algoId` ana emrin `ordId`'sinden bağımsız. 60 saniyelik
+uzlaştırma döngüsünün bel bağladığı varsayım artık ölçülmüş gerçek.
+
+### Faz 2'de bitenler
+- **`config.yaml`** oluşturuldu — tüm sayısal eşiklerin tek kaynağı. 5 parite, RSI eşiği 36,
+  zaman stopu 12 mum, maliyet çarpanı 2,5, spread fallback 2 bps, stop bandı 50–120 bps,
+  profiller (live=hackathon/expected_demo=false, demo=hackathondemo/expected_demo=true).
+  `docs/strateji.md` §10 tablosu bu değerlerle güncellendi.
+- **`tools.py` tamamlandı:** `account_get_balance` (+`availBal` yardımcısı), tüm `spot_*` emir ve
+  uzlaştırma araçları. Limit tavanları metot düzeyinde zorlandı (filter 100, candles 300,
+  indicator 100). Veri çağrıları 2 deneme + üssel bekleme; **emir çağrılarında retry `assert` ile
+  yasaklandı** (`ORDER_TOOLS` frozenset'i, `attempts>1` → AssertionError). Emir güvenlik kapısı
+  (`capabilities.demo` vs `expected_demo`) ve `--dry-run` bağlandı.
+- **`terazi.py`** (tek dosya): 20 sn tur, control.json, mikro katman (OBI/TFI/spread + 30 dk medyan),
+  15m kapanış+15 sn sinyal geçişi, rejim (BTC 1H 48 mum), 5 kapı sırayla, iliştirilmiş TP/SL'li
+  limit alış, 90 sn TTL, 60 sn uzlaştırma, zaman stopu, gün sonu/flatten, state kurtarma.
+  `SetupTracker` ve `add_indicators` `calibrate.py`'den import — canlı ile backtest aynı kod yolu.
+- **Testler (hepsi geçti):**
+  (a) `hackathon --dry-run` 3 tur: 3 karar satırı, 15 mikro satırı, `capabilities.demo=False`,
+  `orders.jsonl` hiç oluşmadı. (b) demo'da emir → dolum → algoId → flatten ile kapanış.
+  (c) pozisyon açıkken `state.json` silindi, yeniden başlatmada uzlaştırma pozisyonu **ve**
+  algoId'yi borsadan kurdu (`KURTARMA SOL-USDT: sz=0.117771 entry=101.79 algoId=…`) — dosyadaki
+  0.117889 değil, **borsanın gerçeği** 0.117771 alındı.
+- Emir sonrası config geri alındı: eşik 36, `demo_test.enabled: false`; yedekle **birebir** diff.
+
+### Faz 2 sürprizleri (hepsi ölçüm, tahmin değil)
+18. **`tpOrdKind: "limit"` SPOT'TA ÇALIŞMIYOR** — kod 51094 "You can't place TP limit orders in
+    spot, margin, or options trading." `docs/mcp-araclari.md` §6'nın CLI yardımından yaptığı
+    çıkarım yanlıştı, düzeltildi. `tpOrdKind` hiç gönderilmeyince emir geçiyor ve `tpOrdPx`
+    sabit fiyat olarak duruyor; strateji.md'nin "hedef BB_mid" gereksinimi korunuyor.
+19. **Emir reddi `ok: true` içinde saklanıyor.** Dış zarf başarılı görünüyor, hata
+    `data.data[0].sCode`'da ve `ordId` boş string. İlk denemede başarısız emri başarılı saydık.
+    `tools.py` artık `_check_scode` ile tek yerde zorluyor — dört emir metodunun hepsinde.
+20. **`market_filter` demo ortamında FİLTRESİZ BİLE 0 satır** döndürüyor (canlıda 22).
+    Canlı piyasa tarama aracı demo hesaba bağlı değil. Evren doğrulaması bu yüzden iki kaynaklı:
+    filtre satır döndürürse o, döndürmezse `ticker.volCcy24h` — hangisi kullanıldığı loglanıyor.
+21. **OKX alış komisyonunu BAZ PARADAN kesiyor.** Dolum 0.117889 SOL, satılabilir 0.117771.
+    Dolum miktarı kadar satmaya kalkmak bakiye yetmezliği demek; çıkış miktarı artık gerçek baz
+    bakiyeyle sınırlanıyor. Borsanın kendi algo emri de 0.117771 ile kurulmuş.
+22. **Gerçek spread varsayımdan 150× küçük.** Ölçülen BTC medyanı **0,013 bps**, varsayım 2 bps idi.
+    Maliyet kapısı 45,0 bps yerine ~40,0 bps'e iniyor, yani kalibrasyon tablosundan **daha
+    geçirgen**. Kalibrasyonun "spread 2 bps" varsayımı muhafazakâr çıktı.
+23. **Kapıda reddedilen aday paritenin ufkunu tüketiyor.** `SetupTracker` tetikte HOLDING'e geçtiği
+    için, aday sonradan mikro/maliyet/risk kapısında reddedilse de o parite 12 mum yeni kurulum
+    aramıyor. Bu **bilinçli**: kalibrasyonun "tetiklenen kurulum ufku tüketir" semantiği ile canlı
+    aynı kalsın diye. Yön muhafazakâr (canlı daha az işlem yapar), ama bilinmesi gerekiyor.
+24. Demo testinde mikro kapısı bir adayı gerçekten reddetti (OBI −0,025 < 0) — kapıların sahte
+    olmadığının kanıtı; ikinci denemede OBI +0,130 ile geçti.
+
+### Faz 2'de ertelenenler
+- **CLI yedeği (Faz 7).** `transport` alanı şimdilik sabit `"mcp"`.
+- **judge (Faz 5).** İmza bırakıldı: `async def judge(candidate, cfg, tools) -> Verdict`;
+  `llm.enabled: false` iken pass-through, `true` iken `NotImplementedError`.
+- **Gerçek PnL'de komisyon.** Kill switch/PnL `totalEq` farkından ölçülüyor (komisyon dolaylı
+  olarak içinde); pozisyon başına net PnL hesabı hâlâ saf fiyat farkı.
+- **Zaman stopu ve gün sonu canlı olarak test edilmedi** — kod yolu flatten ile aynı ve flatten
+  demo'da çalıştı, ama 12 mum dolmuş bir pozisyon görülmedi (Faz 7'ye).
+- `demo_test` bloğu config'de kapalı duruyor; canlıda `capabilities.demo is not True` iken ajan
+  başlamayı reddediyor (bu da test edildi).
+
+### Canlıya geçiş komutu — ÇALIŞTIRILMADI, kullanıcı geçecek
+```bash
+cd /Users/osmancanbozali/Desktop/terazi
+# Önce kontrol: config.yaml'da rsi_setup_threshold 36 ve demo_test.enabled false olmalı.
+.venv/bin/python terazi.py --profile hackathon
+```
+Bayraklar: `--demo` YOK, `--dry-run` YOK (ikisi de emri engeller). `--max-turns` verilmezse
+sonsuz döngü. Duraklatma/durdurma `control.json` ile: `{"mode":"pause"}` · `{"mode":"kill"}` ·
+`{"mode":"run","flatten":true}`. Güvenlik kapısı canlıda `expected_demo=false` bekler; demo
+MCP'sine yanlışlıkla bağlanılırsa emir gitmez, `decisions.jsonl`'e ERROR düşer.
+
+## Faz 2 ön işi — zaman aşımı çıkış sütunu (12 Eylül, 08:42 UTC)
+`calibrate.py`'ye tek sütun eklendi: **z.aşımı çıkış bps** — zaman aşımına düşen tetiklerde
+`j+8` kapanışında çıkılsaydı ortalama PnL bps. Tarama 5 pariteyle yenilendi (XRP + DOGE eklendi;
+ikisinde de 407 kapanmış mum, tekrar eden ts=0, boşluk=0 — veri temiz).
+
+Eşik **36**: BTC +14,2 · ETH +2,0 · SOL +1,8 · XRP −1,8 · DOGE −9,5 bps.
+12 zaman aşımı tetiği üzerinden **ağırlıklı ortalama +1,1 bps**; 18 bps tur maliyeti düşülünce
+**−16,9 bps**.
+
+**Yorum:** zaman aşımı kovası fiyat olarak yatay, komisyonla birlikte kayıp. `j+8`'de erken çıkmak
+bir kâr kaynağı DEĞİL; zaman stopu hasar sınırlayıcıdır. Bu, ufku 8 mumda kesmek yerine
+`time_stop_bars: 12` seçimini destekliyor (pozisyona hedefe gitmesi için daha fazla alan).
+
+## Faz 1 özeti
+**`calibrate.py`: TAMAM** (12 Eylül 2026, 08:30 UTC). Tablo `docs/kalibrasyon.md`'de.
+Eşik seçimi Faz 2'de yapıldı: **36** (sinyal sıklığına göre), `config.yaml`'da.
 
 ## Faz 1'de bitenler
 - `tools.py` ilk taslağı: `OkxTools` async context manager, üç kat zarfı **tek yerde** (`_call`)
@@ -86,19 +183,22 @@
 17. **Markdown tablo başlığında `|Δ|` yazma** — boru işareti sütunu bölüyor, tablo dağılıyor.
 
 ## Ertelenen öneriler
-- Faz 2'de demo profiliyle tek emir atıp iliştirilmiş TP/SL'in `algoId`'sini doğrula (madde 9).
-  **Hâlâ açık** — Faz 1 emirsizdi.
+- ~~Faz 2'de demo profiliyle tek emir atıp iliştirilmiş TP/SL'in `algoId`'sini doğrula (madde 9).~~
+  **KAPANDI** — Faz 2'de doğrulandı, yukarıdaki (b) testine bak.
 - ~~`market_get_indicator` ile RSI karşılaştırması~~ — Faz 1'de yapıldı (madde 15).
 - `logs/` klasörü boş; git boş klasör tutmuyor. İlk log dosyası yazılınca sorun kalmaz.
-- **`config.yaml` henüz yok.** Kullanıcı eşiği seçince Faz 2'de oluşturulacak; `calibrate.py`'ın
-  argparse varsayılanları (strateji.md §10'dan) ilk içeriği için hazır şablon.
-- **Spread 2 bps varsayıldı, ölçülmedi.** Maliyet kapısı bu sayıya duyarlı. Faz 2'de mikro yapı
-  katmanı 20 sn'de bir orderbook örneklerken gerçek medyan spread ölçülüp kapıya beslenmeli.
+- ~~`config.yaml` henüz yok.~~ **Faz 2'de oluşturuldu.**
+- ~~Spread 2 bps varsayıldı, ölçülmedi.~~ **Faz 2'de ölçüldü:** gerçek medyan 0,013 bps (BTC),
+  varsayımın 150× altında. Mikro katman 20 sn'de bir örnekliyor, kapı medyanı kullanıyor
+  (yukarıdaki madde 22).
 - Tarama komisyonu PnL'e uygulamıyor (kazanç/kayıp saf fiyat hareketi); maliyet kapısı ayrı
   sütunda. Faz 2'de gerçek PnL hesabı ücreti düşmeli.
 - 3 günlük pencere parite başına 2–7 kurulum veriyor — **örneklem küçük**. Tablo kalibrasyondur,
   optimizasyon değil; eşiği kazanma yüzdesine göre seçmek aşırı uydurma riski taşır.
 
 ## Canlı ajan durumu
-- Çalışmıyor. Profil: — . Son başlatma: — . (Faz 1 salt okunur geçti; emir gönderilmedi.)
-- Canlı hesap (`hackathon`) bakiyesi: 30 USDT (totalEq 29.9922). Emir gönderilmedi.
+- **Çalışmıyor.** Profil: — . Son başlatma: — . Canlıya **hiç emir gönderilmedi**
+  (Faz 2 canlı testleri `--dry-run` ile geçti; `orders.jsonl`'de canlı satır yok).
+- Canlı hesap (`hackathon`) bakiyesi: 30 USDT (totalEq 29.9925).
+- Demo hesap (`hackathondemo`): 1 emir atıldı ve kapatıldı. SOL bakiyesi toz seviyesinde
+  (1.11e-7), pending algo emri 0 — açık pozisyon kalmadı.

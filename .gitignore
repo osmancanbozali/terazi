@@ -43,3 +43,7 @@ data/
 .vscode/
 .idea/
 .DS_Store
+
+# Çalışma anı durumu (logs/ gibi; repo'ya girmez)
+state.json
+control.json

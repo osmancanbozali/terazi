@@ -1,0 +1,89 @@
+# TERAZİ — tüm sayısal eşiklerin TEK kaynağı.
+# CLAUDE.md kuralı: sayısal eşik koda gömülmez. Kodda sabit sayı arıyorsan yanlış yerdesin.
+# Değerler docs/strateji.md §10 ve docs/kalibrasyon.md kararlarından geldi.
+
+pairs: [BTC-USDT, ETH-USDT, SOL-USDT, XRP-USDT, DOGE-USDT]
+regime_pair: BTC-USDT          # rejim göstergesi; BTC'nin kendi sinyali de açık
+
+universe:
+  min_vol_usd_24h: "10000000"  # market_filter minVolUsd24h
+  filter_limit: 100            # market_filter tavanı; >100 → kod 902 (Faz 1'de ölçüldü)
+
+signal:
+  bar: 15m
+  bb_period: 20
+  bb_std: 2.0
+  rsi_period: 14
+  atr_period: 14
+  rsi_setup_threshold: 36      # sinyal SIKLIĞINA göre seçildi, kazanma yüzdesine göre DEĞİL
+  trigger_window: 2            # kurulumdan sonra tetik için mum sayısı
+  time_stop_bars: 12           # kalibrasyon: j+8 çıkışı komisyonla kayıp → ufku 12'ye aç
+  close_offset_sec: 15         # 15m kapanışından bu kadar sonra sinyal geçişi
+  warmup_bars: 120             # indikatör ısınması için ek mum
+
+regime:
+  bar: 1H
+  lookback: 48                 # son 48 adet 1H mum → RANGE_LOW / RANGE_HIGH
+  refresh_sec: 1800
+  break_low_mult: 0.998        # kapanış < RANGE_LOW × bu → CASH
+  vol_atr_mult: 3.0            # son 15m mum aralığı > bu × ATR → giriş yasağı
+  vol_ban_sec: 1800
+
+micro:
+  sample_sec: 20               # bir tur
+  obi_band_bps: 10             # OBI için orta fiyatın ±bandı
+  obi_min: 0.0                 # mikro teyit: OBI ≥ bu
+  tfi_window_sec: 60
+  orderbook_sz: 20
+  trades_limit: 100
+  spread_median_window_sec: 1800  # 30 dk medyan spread penceresi
+  spread_mult_max: 2.0         # mikro teyit: spread ≤ bu × medyan
+  spread_bps_fallback: 2.0     # ölçülen medyan yoksa; kullanıldığında LOGLANIR
+
+cost:
+  multiplier: 2.5              # hedef_bps ≥ bu × (2×fee_bps + spread_bps)
+
+risk:
+  position_pct: 0.30           # equity × bu (30 USDT'de ≈ 9 USDT)
+  max_concurrent: 2
+  max_daily_trades: 8
+  kill_switch_daily_pct: -1.5
+  cooldown_losses: 2
+  cooldown_sec: 2700           # 45 dk
+  stop_atr_mult: 0.2           # stop = setup_low − bu × ATR
+  min_stop_bps: 50             # stop bandı 50–120 bps; altındaysa 50'ye çekilir
+  max_stop_bps: 120            # üstündeyse aday REDDEDİLİR
+
+execution:
+  limit_order_ttl_sec: 90      # dolmazsa spot_cancel_order, aday düşer
+  reconcile_sec: 60
+  last_entry_local: "18:30"    # sonrasında yeni giriş yok
+  flatten_local: "19:10"       # tüm pozisyonlar kapatılır
+  timezone: Europe/Istanbul
+  error_backoff_sec: 30        # tur hatasında bekleme
+
+profiles:
+  live:
+    name: hackathon
+    demo_flag: false
+    expected_demo: false       # capabilities.demo bununla eşleşmezse EMİR GİTMEZ
+  demo:
+    name: hackathondemo
+    demo_flag: true
+    expected_demo: true
+
+llm:
+  enabled: false               # Faz 5; bu fazda judge pass-through
+  timeout_sec: 20
+
+# SADECE DEMO TEST BLOĞU.
+# enabled: true iken capabilities.demo is not True ise ajan BAŞLAMAYI REDDEDER — canlıda
+# çalışması fiziksel olarak imkânsız. Hiçbir kapı atlanmaz: sentetik ama geçerli bir aday
+# üretilir, maliyet kapısı ve 10 risk kontrolü gerçekten değerlendirilir.
+demo_test:
+  enabled: false
+  pair: SOL-USDT
+  entry_px: ask                # bid_plus_tick | ask (ask = hemen dolması için)
+  target_bps: 100              # TP = giriş × (1 + bu/10000)
+  stop_bps: 100                # SL; 50–120 bandı içinde olmalı
+  notional_usdt: 12            # demo bakiyesinin %30'u yerine küçük emir

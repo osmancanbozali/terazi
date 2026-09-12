@@ -82,6 +82,8 @@ class SetupTracker:
         stop_atr_mult: float = 0.2,
         min_stop_bps: float = 50.0,
         max_stop_bps: float = 120.0,
+        force_setup: bool = False,
+        force_trigger: bool = False,
     ) -> None:
         self.rsi_threshold = rsi_threshold
         self.trigger_window = trigger_window
@@ -89,6 +91,10 @@ class SetupTracker:
         self.stop_atr_mult = stop_atr_mult
         self.min_stop_bps = min_stop_bps
         self.max_stop_bps = max_stop_bps
+        # SADECE DEMO TESTİ (config.yaml `demo_test`). Varsayılan False → kalibrasyon ve canlı
+        # yolu hiç etkilenmez. terazi.py bunları yalnızca capabilities.demo is True iken açar.
+        self.force_setup = force_setup
+        self.force_trigger = force_trigger
         self._reset()
 
     def _reset(self) -> None:
@@ -102,6 +108,8 @@ class SetupTracker:
         self._held = 0
 
     def _is_setup(self, bar: Bar) -> bool:
+        if self.force_setup:
+            return True
         return bar.close < bar.bb_lower and bar.rsi < self.rsi_threshold
 
     def step(self, bar: Bar) -> list[Event]:
@@ -115,12 +123,18 @@ class SetupTracker:
                 self._setup_low = bar.low
                 self._setup_ts = bar.ts
                 self._waited = 0
-                return [Event(Ev.SETUP, bar.ts, {"low": bar.low, "rsi": bar.rsi})]
+                events = [Event(Ev.SETUP, bar.ts, {"low": bar.low, "rsi": bar.rsi})]
+                if self.force_trigger:
+                    # Demo testi: aynı mumda tetikle, iki 15m kapanışı beklemeden.
+                    events += self._open(bar)
+                return events
             return []
 
         if self._state == "WAITING":
             self._waited += 1
-            triggered = bar.close > bar.bb_lower and bar.close > self._setup_low
+            triggered = self.force_trigger or (
+                bar.close > bar.bb_lower and bar.close > self._setup_low
+            )
             if triggered:
                 return self._open(bar)
             if self._waited >= self.trigger_window:
@@ -140,7 +154,10 @@ class SetupTracker:
             outcome = Ev.TIMEOUT
         else:
             return []
-        ev = Event(outcome, bar.ts, {"entry": self._entry, "held": self._held})
+        # `close`: zaman aşımında ufkun son mumunda (j+8) çıkılsaydı hangi fiyat olurdu.
+        ev = Event(
+            outcome, bar.ts, {"entry": self._entry, "held": self._held, "close": bar.close}
+        )
         self._reset()
         return [ev]
 
@@ -247,11 +264,13 @@ class Stats:
     naive_reach: int = 0  # stop yok sayılırsa hedefe değen (ilk spec'teki sayı)
     target_bps: list[float] = None  # type: ignore[assignment]
     stop_bps: list[float] = None  # type: ignore[assignment]
+    timeout_pnl_bps: list[float] = None  # type: ignore[assignment]
     cost_pass: int = 0
 
     def __post_init__(self) -> None:
         self.target_bps = []
         self.stop_bps = []
+        self.timeout_pnl_bps = []
 
     @property
     def resolved(self) -> int:
@@ -268,6 +287,15 @@ class Stats:
     @property
     def avg_stop(self) -> float | None:
         return sum(self.stop_bps) / len(self.stop_bps) if self.stop_bps else None
+
+    @property
+    def avg_timeout_pnl(self) -> float | None:
+        """Zaman aşımına düşen tetiklerde j+8 kapanışında çıkılsaydı ortalama PnL bps.
+
+        Komisyon uygulanmaz — saf fiyat hareketi (tablonun geri kalanıyla aynı konvansiyon).
+        """
+        vals = self.timeout_pnl_bps
+        return sum(vals) / len(vals) if vals else None
 
 
 def scan(bars: list[Bar], threshold: float, args: argparse.Namespace, gate_bps: float) -> Stats:
@@ -312,6 +340,8 @@ def scan(bars: list[Bar], threshold: float, args: argparse.Namespace, gate_bps: 
                 st.losses += 1
             elif ev.kind is Ev.TIMEOUT:
                 st.timeouts += 1
+                entry, close = ev.detail["entry"], ev.detail["close"]
+                st.timeout_pnl_bps.append((close - entry) / entry * 10_000.0)
     return st
 
 
@@ -507,7 +537,8 @@ async def run(args: argparse.Namespace) -> int:
 
     # --- Adım 5: tarama
     header = ["parite", "eşik", "kurulum", "tetik", "stop-RED", "ulaştı(ham)", "kazanç",
-              "kayıp", "z.aşımı", "kazanma %", "ort hedef bps", "ort stop bps", "maliyet ✓"]
+              "kayıp", "z.aşımı", "z.aşımı çıkış bps", "kazanma %", "ort hedef bps",
+              "ort stop bps", "maliyet ✓"]
     table_rows: list[list[str]] = []
     for pair in pairs:
         df = frames[pair].iloc[-window_n:]
@@ -520,7 +551,8 @@ async def run(args: argparse.Namespace) -> int:
             table_rows.append([
                 pair, f"{th:g}", str(s.setups), str(s.triggers), str(s.stop_rejects),
                 str(s.naive_reach), str(s.wins), str(s.losses), str(s.timeouts),
-                fmt(s.win_rate), fmt(s.avg_target), fmt(s.avg_stop), str(s.cost_pass),
+                fmt(s.avg_timeout_pnl), fmt(s.win_rate), fmt(s.avg_target), fmt(s.avg_stop),
+                str(s.cost_pass),
             ])
 
     now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -573,6 +605,9 @@ yakınsamış değerleri kullandığı için tarama etkilenmiyor; ek çalışma 
 - **kazanç / kayıp / z.aşımı**: 8 mumluk ufuk SIRAYLA gezilir; `low ≤ stop` önce gelirse kayıp,
   `high ≥ hedef` önce gelirse kazanç, aynı mumda ikisi de olursa **muhafazakâr = kayıp**,
   hiçbiri olmazsa zaman aşımı. `ulaştı(ham)` ile fark, stop'un önce yendiği işlemlerdir.
+- **z.aşımı çıkış bps**: zaman aşımına düşen tetiklerde **j+8 kapanışında** çıkılsaydı ortalama
+  PnL bps. Bugün zaman aşımı = "sonuçsuz"; bu sütun o kovanın gerçekte artı mı eksi mi olduğunu
+  söyler. Komisyon uygulanmadı (18 bps tur maliyeti bu sayıdan düşülmeli).
 - **kazanma %**: kazanç / (kazanç+kayıp+z.aşımı).
 - **ort hedef bps**: `(BB_mid − giriş)/giriş`, tetik anında dondurulmuş hedefle.
 - **ort stop bps**: `setup_low − 0,2×ATR`; 50 bps'in altındaysa 50'ye çekilmiş hâli (canlı kural).

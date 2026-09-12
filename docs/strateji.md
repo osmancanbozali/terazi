@@ -1,7 +1,7 @@
 # TERAZİ — Trading Stratejisi
 
 **Agentic Trading Hackathon · 12 Eylül 2026 · OKX TR Spot**
-**Rejim: Ortalamaya dönüş (mean reversion) · Pariteler: BTC-USDT, ETH-USDT, SOL-USDT · Sermaye: 30 USDT**
+**Rejim: Ortalamaya dönüş (mean reversion) · Pariteler: BTC, ETH, SOL, XRP, DOGE /USDT · Sermaye: 30 USDT**
 
 > Bu doküman yalnızca trading stratejisini anlatır. Ürün, mimari, dashboard, MCP entegrasyonu ve
 > puanlama haritası `docs/urun-mimari.md`'dedir; yol haritası da orada. Bütün sayısal eşikler
@@ -219,28 +219,35 @@ aralığı ajanın kendisi ölçmesi, mikro teyit, fren-only LLM özgün; üç p
 
 ## 10. Başlangıç parametreleri (config.yaml için)
 
+Faz 2'de `config.yaml` oluşturuldu; aşağıdaki tablo **o dosyadaki gerçek değerlerdir**.
+Çelişki olursa `config.yaml` kazanır (kodda sabit sayı yok).
+
 | Parametre | Değer | Not |
 |---|---|---|
-| pariteler | BTC-USDT, ETH-USDT, SOL-USDT | Faz 0'da doğrula |
-| sinyal zaman dilimi | 15m | |
-| rejim zaman dilimi | 1H, son 48 mum | |
-| BB | 20, 2σ | |
-| RSI kurulum eşiği | 32 | kalibrasyon sonrası 28–36 |
+| pariteler | BTC-USDT, ETH-USDT, SOL-USDT, **XRP-USDT, DOGE-USDT** | Faz 2'de 5'e çıkarıldı; hepsi ≥10M USD hacim filtresinde, 9 USDT hepsinde minSz'ı karşılıyor (en dar XRP 6,6×). Açılışta doğrulanır, geçmeyen evrenden düşer ve loglanır |
+| rejim göstergesi | BTC-USDT | beş pariteye de uygulanır; BTC'nin kendi sinyali de açık |
+| sinyal zaman dilimi | 15m | kapanıştan 15 sn sonra işlenir |
+| rejim zaman dilimi | 1H, son 48 mum | 30 dk'da bir yenilenir |
+| BB | 20, 2σ (popülasyon, ddof=0) | |
+| RSI kurulum eşiği | **36** | kalibrasyon sonrası seçildi — **sinyal sıklığına göre**, kazanma yüzdesine göre değil (örneklem küçük, aşırı uydurma riski) |
 | tetik penceresi | 2 mum | |
+| zaman stopu | **12 kapanmış mum** | kalibrasyon: j+8 çıkışı ham +1,1 bps, komisyonla −16,9 bps → erken çıkış kâr kaynağı değil, ufku aç |
 | OBI bant / eşik | ±10 bps / ≥ 0 | |
-| spread eşiği | 2 × 30 dk medyan | |
-| maliyet çarpanı | 2,5 | |
+| spread eşiği | 2 × 30 dk medyan | medyan yoksa **fallback 2 bps** ve loglanır |
+| maliyet çarpanı | 2,5 | ölçülen maker 8,0 bps → maliyet 18,0 bps → kapı 45,0 bps |
 | vol kesici | son mum aralığı > 3×ATR → 30 dk | |
 | pozisyon boyutu | equity × %30 | |
-| eşzamanlı pozisyon | 2 | |
-| stop | setup_low − 0,2×ATR; min %0,5, max %1,2 | |
-| hedef | BB_mid | |
+| eşzamanlı pozisyon | 2 | parite başına en fazla 1 |
+| stop | setup_low − 0,2×ATR; **bant 50–120 bps** | 50'nin altı 50'ye çekilir, 120'nin üstü **reddedilir** |
+| hedef | BB_mid, maker limit satış (`tpOrdKind: limit`) | |
 | kill switch | −%1,5 günlük | |
 | cooldown | 2 ardışık kayıp → 45 dk | |
 | günlük işlem tavanı | 8 | |
-| limit emir ömrü | 90 sn | |
-| son giriş / kapanış saati | 18:30 / 19:10 | |
-| LLM zaman aşımı | 20 sn, fail-open | |
+| limit emir ömrü | 90 sn | dolmazsa iptal, aday düşer |
+| uzlaştırma periyodu | 60 sn | borsa kaynak gerçek |
+| son giriş / kapanış saati | 18:30 / 19:10 (Europe/Istanbul) | |
+| profiller | live=`hackathon` (expected_demo=false) · demo=`hackathondemo` (expected_demo=true) | emir öncesi `capabilities.demo` bununla karşılaştırılır; eşleşmezse emir gitmez |
+| LLM zaman aşımı | 20 sn, fail-open | Faz 2'de `enabled: false` |
 | LLM modeli | birincil claude-sonnet-5, yedek claude-haiku-4-5 (doğrudan Anthropic API) | |
 
 *Bu bir strateji planıdır, yatırım tavsiyesi değildir.*
