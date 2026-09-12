@@ -1,0 +1,45 @@
+# Ortam / secrets
+.env
+.env.*
+config.toml
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Sanal ortam
+.venv/
+venv/
+env/
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Loglar ve karar kayıtları (gerçek çalışma verisi, repo'ya girmez)
+logs/
+*.log
+decisions.jsonl
+
+# Veri dosyaları (mum verisi vb. yerel önbellek)
+data/
+*.csv
+*.parquet
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
