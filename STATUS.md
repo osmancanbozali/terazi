@@ -45,6 +45,20 @@ lime imleç (`caret-blink`) ekliyor. Akış sürerken input/gönder kilitli kal�
 göstergesi mesaj belirince kayboluyor. Canlı `/ask` ucuna karşı test edildi: metin uzunluğu
 art arda örneklemede kademeli büyüyor (265→314→363→412 karakter), konsol hatası yok.
 
+**Mikro yapı 8→12 pariteye çıktı, 3 satır (kullanıcı isteği).** `micro-cards` grid'i
+`auto-fit`'ten sabit `repeat(4, minmax(0,1fr))`'a döndü — genişlik ne olursa olsun her zaman
+4 sütun, 12 kart = 3 satır (şu an evren 10 parite döndürüyor → 4+4+2). Böylece panel LLM
+panelinin bıraktığı dikey alanı dolduruyor, sayfayı auto-fit'in öngörülemez sarmasına göre
+gereksiz uzatmıyor.
+
+**Kart yerleşimi tek grid'e birleştirildi (kullanıcı isteği).** İki ayrı `<section>` (equity/karar
+akışı + pozisyon/kapanan/ajana-sor, ardından ayrı bir satırda LLM paneli + mikro yapı) tek
+2-sütunlu grid'e birleşti: sol sütun artık Equity eğrisi → Karar akışı → LLM paneli, sağ sütun
+Açık pozisyonlar → Kapanan işlemler → Ajana sor → Mikro yapı. Önceki düzende sağ sütun sol
+sütundan kısa kaldığı için Ajana sor'un altında büyük bir boş alan oluşuyordu (ayrı grid satırı
+en uzun sütuna göre başlıyordu); artık Mikro yapı doğrudan Ajana sor'un altında, diğer kartlarla
+aynı `gap-3.5` boşlukla akıyor.
+
 ## Faz 7.5 — evren genişletme + 5m sinyal + risk seviyeleri: TAMAM (12 Eylül, 17:20 +03:00)
 
 **Teslimat:** `config.yaml` (`universe` genişletildi, `signal.bar` 5m, `time_stop_bars` 24,
