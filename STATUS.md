@@ -1,5 +1,50 @@
 # STATUS
 
+## UI modernizasyonu — OKX tarzı tema: TAMAM (12 Eylül, 17:30 +03:00)
+
+**Teslimat:** `static/index.html` yeniden temalandı, `docs/OKX tarzı UI güncellemesi/Terazi Panel.dc.html`
+tasarım referansı 1:1 uyarlandı: siyah zemin (#000/#0e0f11 kartlar), lime (#d8fa5a) vurgu rengi,
+Manrope + JetBrains Mono yazı tipleri, hap biçimli rozetler, 14/18/999px köşe yarıçapları, sticky
+header + sabit alt kontrol çubuğu, sayfa artık kaydırılabilir (önceki "tek ekran, kaydırmasız"
+kısıtı kaldırıldı — tasarım referansı sayfa kaydırmalı bir düzen istiyordu).
+**Fonksiyonalite değişmedi:** tüm endpoint çağrıları (`/state`, `/feed`, `/llm`, `/equity`, `/micro`,
+`/ask`, `/control`), tüm DOM id'leri, poll döngüsü, modal onay akışı, risk seviyesi butonları,
+sohbet paneli aynı kaldı — yalnızca class/renk/düzen değişti. Canlı sunucuya (PID uvicorn:8787)
+karşı Playwright ile headless test edildi: konsol hatası yok, karar satırı JSON açma/kapama,
+Duraklat/Devam toggle (`control.json` mode gerçekten değişti ve geri alındı), Acil Durdur modalının
+açılıp Vazgeç ile iptali doğrulandı — kill/flatten hiç gönderilmedi. `control.json` test sonunda
+`mode: run` olarak bırakıldı.
+**Al/sat düğmesi eklenmedi; sayısal eşik gömülmedi.**
+Kullanıcı geri bildirimiyle 3 ince ayar: mikro yapı şeridi 5→8 pariteye çıktı (`MICRO_CARDS`),
+header'daki model adı silindi (yalnızca `aktarım` — mcp/cli_fallback — kalıyor), alt çubuktaki
+"control.json mode" etiket metni kaldırıldı (rozet `mode-badge` kendi başına duruyor).
+
+**Kontrol yüzeyi daraltıldı (kullanıcı kararı, onaylandı):** Acil Durdur (`mode: kill`) ve
+Tümünü Kapat (`flatten: true`) düğmeleri + onay modalı UI'dan tamamen kaldırıldı; kontrol
+çubuğunda yalnızca Duraklat/Devam ve risk seviyesi butonları kaldı. CLAUDE.md'nin
+"sadece başlat/duraklat/durdur/kapat, al/sat yok" kuralına göre bunun riski azalttığını
+DEĞİL operatörün acil durdurma/pozisyon kapatma yolunu UI'dan kaldırdığını kullanıcıya
+sorup net onay aldıktan sonra uygulandı — acil durumda `control.json`'u elle düzenlemek veya
+CLI kullanmak gerekecek. `dashboard.py`'de `/control` endpoint'i hâlâ `mode: kill` ve
+`flatten: true`'yu kabul ediyor (sunucu tarafı değişmedi), yalnızca dashboard arayüzünden
+tetiklenemiyor.
+
+**Üst durum şeridi tek satıra sabitlendi (kullanıcı isteği):** `#cards` grid'den flex-nowrap'e
+döndü; "bugün" kartı artık 2 sütuna yayılmıyor, diğerleriyle aynı tek satır kart.
+**Devamında metin kırpılması da düzeltildi:** kartlar `flex-1`+ellipsis yerine `flex-auto`
+(`flex: 1 1 auto`) oldu — `white-space:nowrap` + varsayılan `min-width:auto` sayesinde tarayıcı
+kartı kendi metninin doğal genişliğinin altına hiç küçültmüyor (kırpma yok), aynı zamanda boşta
+kalan alanı kartlar arasında eşit dağıtıp şeridi tüm genişliğe yayıyor. `#cards` konteynerine
+`overflow-x-auto` eklendi — dar ekranlarda şerit ikinci satıra taşmıyor, yalnızca kendi içinde
+yatay kaydırılıyor (sayfanın geri kalanı etkilenmiyor).
+
+**Ajana sor: yazıyor animasyonu (kullanıcı isteği).** Backend `/ask` tek seferde tam cevap
+döndürüyor (gerçek token streaming yok, değiştirilmedi); istemci tarafında `streamReveal()`
+`requestAnimationFrame` ile cevabı harf harf açıyor (uzunluğa göre 250–1800 ms), yanıp sönen
+lime imleç (`caret-blink`) ekliyor. Akış sürerken input/gönder kilitli kalıyor, "düşünüyor…"
+göstergesi mesaj belirince kayboluyor. Canlı `/ask` ucuna karşı test edildi: metin uzunluğu
+art arda örneklemede kademeli büyüyor (265→314→363→412 karakter), konsol hatası yok.
+
 ## Faz 7.5 — evren genişletme + 5m sinyal + risk seviyeleri: TAMAM (12 Eylül, 17:20 +03:00)
 
 **Teslimat:** `config.yaml` (`universe` genişletildi, `signal.bar` 5m, `time_stop_bars` 24,

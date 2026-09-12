@@ -4,185 +4,196 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TERAZİ</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
-  /* Tek ekran, kaydırmasız: karar akışı, sohbet ve sağ sütun kendi içinde kayar. */
-  html, body { height: 100%; overflow: hidden; background: #0a0c10; }
+  html, body { background: #000; }
+  body { font-family: Manrope, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
   ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-thumb { background: #2a3040; border-radius: 4px; }
-  @keyframes slideIn {
-    from { opacity: 0; transform: translateY(-14px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
+  ::-webkit-scrollbar-thumb { background: #2a2c30; border-radius: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  @keyframes terazi-pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
+  .pulse-dot { animation: terazi-pulse 1.6s ease-in-out infinite; }
+  @keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
   .slide-in { animation: slideIn .28s ease-out; }
-  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
-  .pulse { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes caretBlink { 0%,49% { opacity: 1; } 50%,100% { opacity: 0; } }
+  .caret-blink { animation: caretBlink .85s step-end infinite; }
 </style>
 </head>
-<body class="text-slate-200 font-sans text-[13px] antialiased">
-<div class="h-full flex flex-col gap-2 p-3">
+<body class="min-h-screen bg-black text-white">
 
   <!-- ÜST ŞERİT -->
-  <header class="shrink-0 flex flex-col gap-1">
-    <div class="flex items-stretch gap-2">
-      <div class="flex items-center gap-2 pr-3 mr-1 border-r border-slate-800">
-        <span class="text-lg font-bold tracking-widest text-slate-100">TERAZİ</span>
-        <span id="conn" class="hidden text-[10px] px-1.5 py-0.5 rounded bg-red-950 text-red-300 border border-red-800">BAĞLANTI YOK</span>
-      </div>
-      <div id="cards" class="flex items-stretch gap-2 flex-1 min-w-0"></div>
+  <header class="sticky top-0 z-20 flex flex-wrap items-center gap-4 px-4 sm:px-6 py-3.5 border-b border-[rgba(255,255,255,.07)] bg-black/85 backdrop-blur-md">
+    <div class="flex items-center gap-3">
+      <div class="w-[26px] h-[26px] rounded-lg bg-[#d8fa5a] flex items-center justify-center text-black font-extrabold text-[14px]">T</div>
+      <span class="text-[19px] font-extrabold tracking-[.14em]">TERAZİ</span>
     </div>
-    <!-- rejim kartının altındaki tek satır: LLM'in rejim yorumu -->
-    <div id="regime-llm" class="h-[18px] flex items-center gap-2 text-[11px] text-slate-500 truncate"></div>
+    <div class="flex-1 min-w-[8px]"></div>
+    <div class="flex items-center gap-2">
+      <span id="conn" class="hidden items-center gap-2 px-3.5 py-2 rounded-full bg-[rgba(224,55,74,.12)] border border-[rgba(224,55,74,.3)] text-[#ff8a95] text-[13px] font-bold">
+        <span class="w-[7px] h-[7px] rounded-full bg-[#e0374a] pulse-dot"></span>BAĞLANTI YOK
+      </span>
+      <span id="conn-live" class="inline-flex items-center gap-2 px-3.5 py-2 rounded-full bg-[rgba(216,250,90,.1)] border border-[rgba(216,250,90,.25)] text-[#d8fa5a] text-[13px] font-bold">
+        <span class="w-[7px] h-[7px] rounded-full bg-[#d8fa5a] pulse-dot"></span>canlı
+      </span>
+      <span id="header-meta" class="px-3.5 py-2 rounded-full bg-[rgba(255,255,255,.06)] text-[13px] mono text-[#b8bec7]">mcp</span>
+    </div>
   </header>
 
-  <!-- SOL (equity + karar akışı) + SAĞ (pozisyon / emir / sohbet) -->
-  <main class="flex-1 min-h-0 grid grid-cols-3 gap-2">
+  <div class="max-w-[1840px] mx-auto px-4 sm:px-6 pt-5 pb-[120px] flex flex-col gap-3.5">
 
-    <section class="col-span-2 min-h-0 flex flex-col gap-2">
-      <div class="shrink-0 h-[142px] flex flex-col rounded-lg bg-slate-900/60 border border-slate-800">
-        <div class="shrink-0 flex items-baseline justify-between px-3 py-1.5 border-b border-slate-800">
-          <h2 class="font-semibold text-slate-300">Equity eğrisi</h2>
-          <span id="eq-meta" class="text-[11px] text-slate-500"></span>
+    <!-- ÜST DURUM KARTLARI -->
+    <section id="cards" class="flex flex-nowrap gap-2 overflow-x-auto"></section>
+
+    <!-- REJİM KARTININ ALTINDAKİ LLM YORUMU -->
+    <section class="rounded-[18px] bg-[#0e0f11] border border-[rgba(255,255,255,.06)] px-5 py-4 flex flex-wrap gap-4 items-start">
+      <div id="regime-llm" class="flex flex-wrap items-baseline gap-3 w-full"></div>
+    </section>
+
+    <!-- SOL (equity + karar akışı) + SAĞ (pozisyon / emir / sohbet) -->
+    <section class="grid gap-3.5 items-start" style="grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));">
+
+      <div class="flex flex-col gap-3.5 min-w-0">
+        <div class="rounded-[18px] bg-[#0e0f11] border border-[rgba(255,255,255,.06)] p-5">
+          <div class="flex items-baseline justify-between gap-4 flex-wrap">
+            <h2 class="text-[18px] font-bold">Equity eğrisi</h2>
+            <span id="eq-meta" class="text-[13px] text-[#7d838c] mono"></span>
+          </div>
+          <div class="mt-4 h-[220px]"><canvas id="eq-chart"></canvas></div>
         </div>
-        <div class="flex-1 min-h-0 px-2 py-1"><canvas id="eq-chart"></canvas></div>
+
+        <div class="rounded-[18px] bg-[#0e0f11] border border-[rgba(255,255,255,.06)] p-5">
+          <div class="flex items-baseline justify-between gap-4 flex-wrap">
+            <h2 class="text-[18px] font-bold">Karar akışı</h2>
+            <span id="feed-meta" class="text-[13px] text-[#7d838c]"></span>
+          </div>
+          <div id="feed" class="mt-3.5 flex flex-col gap-1.5 max-h-[520px] overflow-y-auto"></div>
+        </div>
       </div>
 
-      <div class="flex-1 min-h-0 flex flex-col rounded-lg bg-slate-900/60 border border-slate-800">
-        <div class="shrink-0 flex items-baseline justify-between px-3 py-2 border-b border-slate-800">
-          <h2 class="font-semibold text-slate-300">Karar akışı</h2>
-          <span id="feed-meta" class="text-[11px] text-slate-500"></span>
+      <div class="flex flex-col gap-3.5 min-w-0">
+        <div class="rounded-[18px] bg-[#0e0f11] border border-[rgba(255,255,255,.06)] p-5">
+          <div class="flex items-baseline justify-between gap-3 flex-wrap">
+            <h2 class="text-[18px] font-bold">Açık pozisyonlar</h2>
+            <span id="pos-meta" class="text-[13px] text-[#7d838c] mono"></span>
+          </div>
+          <div id="positions" class="mt-3.5 max-h-[220px] overflow-y-auto"></div>
         </div>
-        <div id="feed" class="flex-1 min-h-0 overflow-y-auto px-1.5 py-1.5 space-y-1"></div>
+
+        <div class="rounded-[18px] bg-[#0e0f11] border border-[rgba(255,255,255,.06)] p-5">
+          <div class="flex items-baseline justify-between gap-3 flex-wrap">
+            <h2 class="text-[18px] font-bold">Kapanan işlemler</h2>
+            <span id="ord-meta" class="text-[13px] text-[#7d838c] mono"></span>
+          </div>
+          <div id="closed" class="mt-3.5 flex flex-col gap-1.5 max-h-[220px] overflow-y-auto"></div>
+        </div>
+
+        <!-- AJANA SOR -->
+        <div class="rounded-[18px] bg-[#0e0f11] border border-[rgba(255,255,255,.06)] p-5 flex flex-col">
+          <div class="flex items-baseline justify-between gap-3 flex-wrap">
+            <h2 class="text-[18px] font-bold">Ajana sor</h2>
+            <span class="text-[12.5px] text-[#62676f]">salt okunur · emir veremez</span>
+          </div>
+          <div id="chat-log" class="mt-3.5 h-[260px] overflow-y-auto rounded-[12px] bg-[#131417] p-3 space-y-2"></div>
+          <div id="chat-presets" class="mt-3 flex flex-wrap gap-2"></div>
+          <div class="mt-3 flex gap-2">
+            <input id="chat-input" type="text" maxlength="600" placeholder="Ajana bir şey sor…"
+                   class="flex-1 min-w-0 px-4 py-3 rounded-[12px] bg-[#131417] border border-[rgba(255,255,255,.09)] text-white
+                          placeholder:text-[#62676f] focus:outline-none focus:border-[rgba(216,250,90,.5)] text-[14px]">
+            <button id="chat-send" class="px-5 py-3 rounded-[12px] border-none bg-[#d8fa5a] hover:bg-[#e6ff86] text-black text-[14px] font-extrabold transition-colors">Sor</button>
+          </div>
+        </div>
       </div>
     </section>
 
-    <section class="min-h-0 flex flex-col gap-2 overflow-y-auto">
-      <div class="shrink-0 h-[128px] flex flex-col rounded-lg bg-slate-900/60 border border-slate-800">
-        <div class="shrink-0 flex items-baseline justify-between px-3 py-1.5 border-b border-slate-800">
-          <h2 class="font-semibold text-slate-300">Açık pozisyonlar</h2>
-          <span id="pos-meta" class="text-[11px] text-slate-500"></span>
+    <!-- ALT ŞERİT: LLM paneli + mikro sparkline'lar -->
+    <section class="grid gap-3.5 items-start" style="grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));">
+      <div class="rounded-[18px] bg-[#0e0f11] border border-[rgba(255,255,255,.06)] p-5 min-w-0">
+        <div class="flex items-baseline justify-between gap-3 flex-wrap">
+          <div class="flex items-baseline gap-2.5">
+            <h2 class="text-[18px] font-bold">LLM paneli</h2>
+            <span class="text-[13px] text-[#62676f]">yargıç + rejim yorumcusu</span>
+          </div>
+          <span id="llm-meta" class="text-[13px] text-[#7d838c]"></span>
         </div>
-        <div id="positions" class="flex-1 min-h-0 overflow-y-auto p-2"></div>
+        <div id="llm-rows" class="mt-3.5 flex flex-col gap-1.5 max-h-[420px] overflow-y-auto"></div>
       </div>
 
-      <div class="shrink-0 h-[108px] flex flex-col rounded-lg bg-slate-900/60 border border-slate-800">
-        <div class="shrink-0 flex items-baseline justify-between px-3 py-1.5 border-b border-slate-800">
-          <h2 class="font-semibold text-slate-300">Kapanan işlemler</h2>
-          <span id="ord-meta" class="text-[11px] text-slate-500"></span>
+      <div class="rounded-[18px] bg-[#0e0f11] border border-[rgba(255,255,255,.06)] p-5 min-w-0">
+        <div class="flex items-baseline justify-between gap-3 flex-wrap">
+          <div class="flex items-baseline gap-2.5">
+            <h2 class="text-[18px] font-bold">Mikro yapı</h2>
+            <span class="text-[13px] text-[#62676f]">OBI · spread bps</span>
+          </div>
+          <span id="micro-meta" class="text-[13px] text-[#7d838c]"></span>
         </div>
-        <div id="closed" class="flex-1 min-h-0 overflow-y-auto p-2 space-y-1"></div>
-      </div>
-
-      <!-- AJANA SOR -->
-      <div class="flex-1 min-h-[220px] flex flex-col rounded-lg bg-slate-900/60 border border-slate-800">
-        <div class="shrink-0 flex items-baseline justify-between px-3 py-1.5 border-b border-slate-800">
-          <h2 class="font-semibold text-slate-300">Ajana sor</h2>
-          <span class="text-[10px] text-slate-600">salt okunur · emir veremez</span>
-        </div>
-        <div id="chat-log" class="flex-1 min-h-0 overflow-y-auto p-2 space-y-2"></div>
-        <div id="chat-presets" class="shrink-0 flex flex-wrap gap-1 px-2 pb-1"></div>
-        <div class="shrink-0 flex gap-1 px-2 pb-2">
-          <input id="chat-input" type="text" maxlength="600" placeholder="Ajana bir şey sor…"
-                 class="flex-1 min-w-0 px-2 py-1.5 rounded bg-slate-950 border border-slate-700 text-slate-200
-                        placeholder:text-slate-600 focus:outline-none focus:border-slate-500">
-          <button id="chat-send" class="px-3 py-1.5 rounded font-semibold bg-slate-700 hover:bg-slate-600 transition-colors">Sor</button>
+        <div id="micro-cards" class="mt-3.5 grid gap-2.5" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));"></div>
+        <div class="mt-3.5 flex gap-4 text-[12.5px] text-[#7d838c]">
+          <span class="flex items-center gap-1.5"><span class="w-[14px] h-[2px] rounded bg-[#8b7cff]"></span>OBI</span>
+          <span class="flex items-center gap-1.5"><span class="w-[14px] h-[2px] rounded bg-[#3fd8e0]"></span>spread bps</span>
         </div>
       </div>
     </section>
-  </main>
-
-  <!-- ALT ŞERİT: LLM paneli + mikro sparkline'lar -->
-  <section class="shrink-0 h-[148px] grid grid-cols-2 gap-2">
-    <div class="min-w-0 flex flex-col rounded-lg bg-slate-900/60 border border-slate-800">
-      <div class="shrink-0 flex items-baseline justify-between px-3 py-1.5 border-b border-slate-800">
-        <h2 class="font-semibold text-slate-300">LLM paneli <span class="text-[10px] font-normal text-slate-600">yargıç + rejim yorumcusu</span></h2>
-        <span id="llm-meta" class="text-[11px] text-slate-500"></span>
-      </div>
-      <div id="llm-rows" class="flex-1 min-h-0 overflow-y-auto px-1.5 py-1 space-y-1"></div>
-    </div>
-
-    <div class="min-w-0 flex flex-col rounded-lg bg-slate-900/60 border border-slate-800">
-      <div class="shrink-0 flex items-baseline justify-between px-3 py-1.5 border-b border-slate-800">
-        <h2 class="font-semibold text-slate-300">Mikro yapı <span class="text-[10px] font-normal text-slate-600">OBI · spread bps</span></h2>
-        <span id="micro-meta" class="text-[11px] text-slate-500"></span>
-      </div>
-      <!-- grid satırı auto olursa Chart.js'in responsive canvas'ı kartı büyütüp alt çubuğu eziyor;
-           grid-rows-1 + min-h-0 + overflow-hidden bunu kilitliyor. -->
-      <div id="micro-cards" class="flex-1 min-h-0 grid grid-cols-5 grid-rows-1 gap-1 px-1.5 py-1"></div>
-    </div>
-  </section>
+  </div>
 
   <!-- KONTROL ÇUBUĞU -->
-  <footer class="shrink-0 flex items-center gap-3 rounded-lg bg-slate-900/60 border border-slate-800 px-3 py-1.5">
-    <button id="btn-toggle" class="px-4 py-1.5 rounded font-semibold bg-slate-700 hover:bg-slate-600 transition-colors">…</button>
-    <button id="btn-kill" class="px-4 py-1.5 rounded font-semibold bg-red-900/70 hover:bg-red-800 text-red-100 border border-red-700 transition-colors">Acil Durdur</button>
-    <button id="btn-flatten" class="px-4 py-1.5 rounded font-semibold bg-amber-900/60 hover:bg-amber-800 text-amber-100 border border-amber-700 transition-colors">Tümünü Kapat</button>
-    <div class="ml-2 flex items-center gap-2 text-[11px]">
-      <span class="text-slate-500">control.json mode</span>
-      <span id="mode-badge" class="px-2 py-0.5 rounded font-mono font-semibold">…</span>
-      <span id="flatten-badge" class="hidden px-2 py-0.5 rounded font-mono bg-amber-950 text-amber-300 border border-amber-800">flatten=true</span>
+  <footer class="fixed left-0 right-0 bottom-0 z-30 flex flex-wrap items-center gap-3 px-4 sm:px-6 py-3.5 bg-black/90 backdrop-blur-md border-t border-[rgba(255,255,255,.08)]">
+    <button id="btn-toggle" class="px-5 py-3 rounded-full font-bold text-[14px] bg-[rgba(255,255,255,.06)] border border-[rgba(255,255,255,.12)] text-[#e6e9ee] hover:bg-[rgba(255,255,255,.12)] transition-colors">…</button>
+    <div class="ml-2 flex items-center gap-2.5">
+      <span id="mode-badge" class="px-3 py-1.5 rounded-full font-bold text-[13px] mono">…</span>
+      <span id="flatten-badge" class="hidden px-3 py-1.5 rounded-full font-bold text-[13px] mono bg-[rgba(240,180,60,.14)] text-[#f3c265] border border-[rgba(240,180,60,.3)]">flatten=true</span>
     </div>
-    <!-- risk seviyesi: boyut + tavanları değiştirir, AÇIK POZİSYONLARA DOKUNMAZ. Al/sat değil. -->
-    <div class="ml-3 flex items-center gap-2 text-[11px]">
-      <span class="text-slate-500">risk seviyesi</span>
-      <div id="risk-levels" class="flex items-center gap-1"></div>
+    <div class="flex items-center gap-2.5">
+      <span class="text-[13px] text-[#7d838c] mono">risk seviyesi</span>
+      <div id="risk-levels" class="flex items-center gap-1.5"></div>
     </div>
-    <div class="ml-auto text-[11px] text-slate-600">Al/sat düğmesi yoktur — operatör yüzeyi yalnızca duraklat / durdur / kapat.</div>
+    <div class="flex-1 min-w-[12px]"></div>
+    <span class="text-[13px] text-[#62676f]">Al/sat düğmesi yoktur — operatör yüzeyi yalnızca duraklat / devam.</span>
   </footer>
-</div>
-
-<!-- MODAL -->
-<div id="modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50">
-  <div class="w-[430px] rounded-lg bg-slate-900 border border-slate-700 p-5 shadow-2xl">
-    <h3 id="modal-title" class="text-base font-bold mb-2"></h3>
-    <p id="modal-body" class="text-slate-300 leading-relaxed mb-5"></p>
-    <div class="flex justify-end gap-2">
-      <button id="modal-cancel" class="px-4 py-1.5 rounded bg-slate-700 hover:bg-slate-600">Vazgeç</button>
-      <button id="modal-ok" class="px-4 py-1.5 rounded font-semibold"></button>
-    </div>
-  </div>
-</div>
 
 <script>
 // ---- action rozet renkleri (spec) -----------------------------------------
 const ACTION_STYLE = {
-  WAIT:      "bg-slate-800 text-slate-400 border-slate-700",
-  SETUP:     "bg-blue-950 text-blue-300 border-blue-800",
-  CANDIDATE: "bg-purple-950 text-purple-300 border-purple-800",
-  REJECT:    "bg-orange-950 text-orange-300 border-orange-800",
-  ORDER:     "bg-green-950 text-green-300 border-green-800",
-  FILL:      "bg-green-900 text-green-200 border-green-700",
-  EXIT:      "bg-yellow-950 text-yellow-300 border-yellow-800",
-  CASH:      "bg-yellow-950 text-yellow-300 border-yellow-800",
-  ERROR:     "bg-red-950 text-red-300 border-red-700",
-  EOD_FLATTEN_DONE: "bg-yellow-900 text-yellow-200 border-yellow-700",
-  UNIVERSE:  "bg-sky-950 text-sky-300 border-sky-800",   // evren seçimi (Faz 7.5)
+  WAIT:      "bg-[rgba(255,255,255,.07)] text-[#b9bfc8] border-[rgba(255,255,255,.08)]",
+  SETUP:     "bg-[rgba(120,160,255,.14)] text-[#9fbcff] border-[rgba(120,160,255,.22)]",
+  CANDIDATE: "bg-[rgba(139,124,255,.14)] text-[#b3a6ff] border-[rgba(139,124,255,.22)]",
+  REJECT:    "bg-[rgba(255,150,80,.14)] text-[#ffab66] border-[rgba(255,150,80,.22)]",
+  ORDER:     "bg-[rgba(216,250,90,.12)] text-[#d8fa5a] border-[rgba(216,250,90,.25)]",
+  FILL:      "bg-[rgba(216,250,90,.18)] text-[#e6ff86] border-[rgba(216,250,90,.32)]",
+  EXIT:      "bg-[rgba(240,180,60,.14)] text-[#f3c265] border-[rgba(240,180,60,.24)]",
+  CASH:      "bg-[rgba(240,180,60,.14)] text-[#f3c265] border-[rgba(240,180,60,.24)]",
+  ERROR:     "bg-[#e0374a] text-white border-[#e0374a]",
+  EOD_FLATTEN_DONE: "bg-[rgba(240,180,60,.2)] text-[#ffdca0] border-[rgba(240,180,60,.3)]",
+  UNIVERSE:  "bg-[rgba(63,216,224,.14)] text-[#3fd8e0] border-[rgba(63,216,224,.24)]",   // evren seçimi (Faz 7.5)
 };
-// Kapanan işlemin çıkış sebebi: tp yeşil · sl kırmızı · diğerleri nötr
+// Kapanan işlemin çıkış sebebi: tp lime · sl kırmızı · diğerleri nötr
 const EXIT_STYLE = {
-  tp:       "bg-green-950 text-green-300 border-green-800",
-  sl:       "bg-red-950 text-red-300 border-red-700",
-  tp_sl:    "bg-slate-800 text-slate-400 border-slate-700",
-  time:     "bg-blue-950 text-blue-300 border-blue-800",
-  eod:      "bg-yellow-950 text-yellow-300 border-yellow-800",
-  operator: "bg-slate-100 text-slate-900 border-slate-300",
+  tp:       "bg-[rgba(216,250,90,.12)] text-[#d8fa5a] border-[rgba(216,250,90,.25)]",
+  sl:       "bg-[rgba(224,55,74,.14)] text-[#ff8a95] border-[rgba(224,55,74,.24)]",
+  tp_sl:    "bg-[rgba(255,255,255,.07)] text-[#b9bfc8] border-[rgba(255,255,255,.08)]",
+  time:     "bg-[rgba(120,160,255,.14)] text-[#9fbcff] border-[rgba(120,160,255,.22)]",
+  eod:      "bg-[rgba(240,180,60,.14)] text-[#f3c265] border-[rgba(240,180,60,.24)]",
+  operator: "bg-[rgba(255,255,255,.92)] text-[#0b0c0e] border-transparent",
 };
-const OPERATOR_STYLE = "bg-slate-100 text-slate-900 border-slate-300";
+const OPERATOR_STYLE = "bg-[rgba(255,255,255,.92)] text-[#0b0c0e] border-transparent";
 const styleFor = a => (a || "").startsWith("OPERATOR_") ? OPERATOR_STYLE
-                    : (ACTION_STYLE[a] || "bg-slate-800 text-slate-400 border-slate-700");
+                    : (ACTION_STYLE[a] || "bg-[rgba(255,255,255,.07)] text-[#b9bfc8] border-[rgba(255,255,255,.08)]");
 
-// LLM çağrı durumu: ok yeşil · fallback sarı (yedek model) · failed_open kırmızı (ikisi de düştü)
+// LLM çağrı durumu: ok lime · fallback amber (yedek model) · failed_open kırmızı (ikisi de düştü)
 const LLM_STATUS_STYLE = {
-  ok:          "bg-green-950 text-green-300 border-green-800",
-  fallback:    "bg-yellow-950 text-yellow-300 border-yellow-800",
-  failed_open: "bg-red-950 text-red-300 border-red-700",
-  disabled:    "bg-slate-800 text-slate-400 border-slate-700",
+  ok:          "bg-[rgba(216,250,90,.12)] text-[#d8fa5a] border-[rgba(216,250,90,.25)]",
+  fallback:    "bg-[rgba(240,180,60,.14)] text-[#f3c265] border-[rgba(240,180,60,.24)]",
+  failed_open: "bg-[rgba(224,55,74,.14)] text-[#ff8a95] border-[rgba(224,55,74,.24)]",
+  disabled:    "bg-[rgba(255,255,255,.07)] text-[#b9bfc8] border-[rgba(255,255,255,.08)]",
 };
 const VERDICT_STYLE = {
-  APPROVE: "bg-green-950 text-green-300 border-green-800",
-  REDUCE:  "bg-yellow-950 text-yellow-300 border-yellow-800",
-  VETO:    "bg-red-950 text-red-300 border-red-700",
+  APPROVE: "bg-[rgba(216,250,90,.12)] text-[#d8fa5a] border-[rgba(216,250,90,.25)]",
+  REDUCE:  "bg-[rgba(240,180,60,.14)] text-[#f3c265] border-[rgba(240,180,60,.24)]",
+  VETO:    "bg-[rgba(224,55,74,.14)] text-[#ff8a95] border-[rgba(224,55,74,.24)]",
 };
 
 const seen = new Set();       // animasyon yalnızca GERÇEKTEN yeni satıra
@@ -205,29 +216,29 @@ const shortId = id => !id ? "—" : (id.length <= 12 ? id : `${id.slice(0, 6)}�
 
 // ---- üst şerit -------------------------------------------------------------
 function card(label, value, cls = "", title = "") {
-  return `<div class="flex flex-col justify-center px-3 py-1.5 rounded-lg border ${cls || "bg-slate-900/60 border-slate-800"}"
+  return `<div class="flex-auto flex flex-col justify-center whitespace-nowrap px-3.5 py-3 rounded-[14px] border ${cls || "bg-[#0e0f11] border-[rgba(255,255,255,.06)]"}"
                ${title ? `title="${esc(title)}"` : ""}>
-            <div class="text-[10px] uppercase tracking-wider opacity-60 leading-tight">${esc(label)}</div>
-            <div class="font-semibold leading-tight whitespace-nowrap">${value}</div>
+            <div class="text-[10px] uppercase tracking-[.08em] font-bold opacity-60">${esc(label)}</div>
+            <div class="mt-1.5 text-[14px] font-bold leading-tight">${value}</div>
           </div>`;
 }
 
 function renderCards(s) {
   const st = s.state || {}, c = s.counts || {}, out = [];
 
-  // rejim: MEAN_REVERSION yeşil · CASH gri · giriş yasağı sarı
+  // rejim: MEAN_REVERSION lime · CASH nötr · giriş yasağı amber
   const rg = s.regime || {};
-  let rgCls = "bg-green-950/70 border-green-800 text-green-300", rgTxt = rg.level || "—";
-  if (rg.entry_ban) { rgCls = "bg-yellow-950/70 border-yellow-700 text-yellow-300"; rgTxt = `${rg.level} · GİRİŞ YASAĞI`; }
-  else if (rg.level === "CASH") { rgCls = "bg-slate-800 border-slate-600 text-slate-300"; }
-  out.push(card("rejim", esc(rgTxt), rgCls, rg.reason || ""));
+  let rgCls = "bg-[rgba(216,250,90,.1)] border-[rgba(216,250,90,.25)] text-[#d8fa5a]", rgTxt = rg.level || "—";
+  if (rg.entry_ban) { rgCls = "bg-[rgba(240,180,60,.1)] border-[rgba(240,180,60,.3)] text-[#f3c265]"; rgTxt = `${rg.level} · GİRİŞ YASAĞI`; }
+  else if (rg.level === "CASH") { rgCls = "bg-[rgba(255,255,255,.06)] border-[rgba(255,255,255,.12)] text-[#ced3da]"; }
+  out.push(card("rejim", `<span class="mono">${esc(rgTxt)}</span>`, rgCls, rg.reason || ""));
 
-  out.push(card("equity", `${num(st.equity, 4)} <span class="opacity-50 text-[11px]">USDT</span>`));
+  out.push(card("equity", `<span class="mono">${num(st.equity, 4)}</span> <span class="opacity-50 text-[11px]">USDT</span>`));
 
   const pnl = Number(st.daily_pnl_pct ?? 0);
-  const pnlCls = pnl > 0 ? "bg-green-950/70 border-green-800 text-green-300"
-               : pnl < 0 ? "bg-red-950/70 border-red-800 text-red-300"
-                         : "bg-slate-900/60 border-slate-800";
+  const pnlCls = pnl > 0 ? "bg-[rgba(216,250,90,.1)] border-[rgba(216,250,90,.25)] text-[#d8fa5a]"
+               : pnl < 0 ? "bg-[rgba(224,55,74,.12)] border-[rgba(224,55,74,.3)] text-[#ff8a95]"
+                         : "bg-[#0e0f11] border-[rgba(255,255,255,.06)]";
   out.push(card("günlük pnl", `${pnl > 0 ? "+" : ""}${pnl.toFixed(3)}%`, pnlCls));
 
   const nPos = (s.positions || []).length, nPend = (s.pending || []).length;
@@ -238,30 +249,30 @@ function renderCards(s) {
   if (ks.active) {
     const label = ks.reasons.includes("daily_loss") ? "KILL SWITCH — günlük zarar" : "DURDURULDU — operatör";
     const both = ks.reasons.length > 1 ? "KILL SWITCH — günlük zarar + operatör" : label;
-    out.push(card("risk", esc(both), "bg-red-950 border-red-700 text-red-300", ks.detail));
+    out.push(card("risk", esc(both), "bg-[rgba(224,55,74,.12)] border-[rgba(224,55,74,.35)] text-[#ff8a95]", ks.detail));
   } else if (cd.active) {
-    out.push(card("risk", `COOLDOWN ${cd.minutes_left} dk`, "bg-orange-950/70 border-orange-800 text-orange-300",
+    out.push(card("risk", `COOLDOWN ${cd.minutes_left} dk`, "bg-[rgba(240,180,60,.1)] border-[rgba(240,180,60,.3)] text-[#f3c265]",
                   `${cd.consecutive_losses} ardışık kayıp`));
   } else {
-    out.push(card("risk", "açık", "bg-green-950/70 border-green-800 text-green-300", "kill switch kapalı, cooldown yok"));
+    out.push(card("risk", "açık", "bg-[rgba(216,250,90,.1)] border-[rgba(216,250,90,.25)] text-[#d8fa5a]", "kill switch kapalı, cooldown yok"));
   }
 
   // canlılık
   if (s.agent_alive) {
     const a = s.last_decision_age_sec;
-    out.push(card("ajan", `<span class="inline-block w-2 h-2 rounded-full bg-green-400 mr-1.5 align-middle"></span>` +
-                          (a == null ? "çalışıyor" : `son karar ${a} sn önce`),
-                  "bg-green-950/40 border-green-900", `state.json yaşı ${s.state_age_sec} sn`));
+    out.push(card("ajan", `<span class="inline-block w-[7px] h-[7px] rounded-full bg-[#d8fa5a] mr-1.5 align-middle"></span>` +
+                          (a == null ? "çalışıyor" : `${a} sn önce`),
+                  "bg-[rgba(216,250,90,.06)] border-[rgba(216,250,90,.18)]", `son karar ${a == null ? "" : a + " sn önce"} · state.json yaşı ${s.state_age_sec} sn`));
   } else {
-    out.push(card("ajan", `<span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-1.5 align-middle pulse"></span>AJAN YANIT VERMİYOR`,
-                  "bg-red-950 border-red-700 text-red-300",
+    out.push(card("ajan", `<span class="inline-block w-[7px] h-[7px] rounded-full bg-[#e0374a] mr-1.5 align-middle pulse-dot"></span>AJAN YANIT VERMİYOR`,
+                  "bg-[rgba(224,55,74,.12)] border-[rgba(224,55,74,.35)] text-[#ff8a95]",
                   `state.json ${s.state_age_sec ?? "?"} sn önce yazıldı (eşik ${s.stale_sec} sn)`));
   }
 
   // risk seviyesi rozeti (Faz 7.5): aktif seviye + o seviyenin beş parametresi tooltip'te
   const lvl = (s.control || {}).risk_level || "—", lp = (s.risk_levels || {})[lvl] || {};
   out.push(card("seviye", esc(LEVEL_LABEL[lvl] || lvl),
-                LEVEL_STYLE[lvl] ? LEVEL_STYLE[lvl].replace("border border-", "border-") : "bg-slate-900/60 border-slate-800",
+                LEVEL_STYLE[lvl] || "bg-[#0e0f11] border-[rgba(255,255,255,.06)]",
                 lp.position_pct == null ? "" :
                   `boyut %${(Number(lp.position_pct) * 100).toFixed(0)} · eşzamanlı ${lp.max_concurrent} · ` +
                   `günlük tavan ${lp.max_daily_trades} · kill ${lp.kill_switch_daily_pct}% · ` +
@@ -270,25 +281,30 @@ function renderCards(s) {
   // evren + tur bütçesi: 20 parite 20 sn'ye sığıyor mu? (Faz 7.5 ölçümü, state.json'dan)
   if (st.turn_requests != null) {
     out.push(card("tur", `${st.turn_requests} istek · ${((st.turn_ms || 0) / 1000).toFixed(1)} sn`,
-                  (st.turn_ms || 0) > 20000 ? "bg-orange-950/70 border-orange-800 text-orange-300"
-                                            : "bg-slate-900/60 border-slate-800",
+                  (st.turn_ms || 0) > 20000 ? "bg-[rgba(240,180,60,.1)] border-[rgba(240,180,60,.3)] text-[#f3c265]"
+                                            : "bg-[#0e0f11] border-[rgba(255,255,255,.06)]",
                   "son turda borsaya giden istek sayısı ve turun süresi (mikro periyodu 20 sn)"));
   }
 
-  // aktarım: mcp yeşil · cli_fallback turuncu (urun-mimari.md §4 üst şerit)
+  // aktarım: mcp lime · cli_fallback amber (urun-mimari.md §4 üst şerit)
   const tr = st.transport || "mcp";
   out.push(card("aktarım", esc(tr),
-                tr === "mcp" ? "bg-green-950/40 border-green-900 text-green-300"
-                             : "bg-orange-950/70 border-orange-800 text-orange-300",
+                tr === "mcp" ? "bg-[rgba(216,250,90,.06)] border-[rgba(216,250,90,.18)] text-[#d8fa5a]"
+                             : "bg-[rgba(240,180,60,.1)] border-[rgba(240,180,60,.3)] text-[#f3c265]",
                 tr === "mcp" ? "MCP oturumu sağlam"
                              : "MCP düştü, veri çağrıları okx CLI yedeğinden geliyor"));
 
-  out.push(card("bugün", `${c.total || 0} karar · ${c.WAIT || 0} bekle · ${c.REJECT || 0} red · ${c.ORDER || 0} emir`,
-                "bg-slate-900/60 border-slate-800",
+  out.push(card("bugün", `<span class="mono">${c.total || 0} karar · ${c.WAIT || 0} bekle · <span class="text-[#ff8a95]">${c.REJECT || 0} red</span> · <span class="text-[#d8fa5a]">${c.ORDER || 0} emir</span></span>`,
+                "bg-[#0e0f11] border-[rgba(255,255,255,.06)]",
                 `SETUP ${c.SETUP || 0} · CANDIDATE ${c.CANDIDATE || 0} · FILL ${c.FILL || 0} · EXIT ${c.EXIT || 0} · ` +
                 `CASH ${c.CASH || 0} · ERROR ${c.ERROR || 0} · OPERATOR_* ${c.OPERATOR || 0}`));
 
   $("cards").innerHTML = out.join("");
+}
+
+// ---- header sağ üst: aktarım -----------------------------------------------
+function renderHeaderMeta(s) {
+  $("header-meta").textContent = (s.state || {}).transport || "mcp";
 }
 
 // ---- rejim kartının altındaki LLM yorumu ----------------------------------
@@ -296,24 +312,27 @@ function renderRegimeLlm(s) {
   const rc = s.regime_commentary;
   const box = $("regime-llm");
   if (!rc) {
-    box.innerHTML = `<span class="text-slate-700">LLM rejim yorumu yok (ilk yorum açılışta, sonra 30 dk'da bir)</span>`;
+    box.innerHTML = `<span class="text-[#62676f]">LLM rejim yorumu yok (ilk yorum açılışta, sonra 30 dk'da bir)</span>`;
     return;
   }
   const st = rc.status || "ok";
-  const stCls = st === "ok" ? "text-slate-500" : st === "fallback" ? "text-yellow-400" : "text-red-400";
+  const stCls = st === "ok" ? "text-[#7d838c]" : st === "fallback" ? "text-[#f3c265]" : "text-[#ff8a95]";
   const conflict = rc.conflict
-    ? `<span class="px-1.5 py-0.5 rounded bg-orange-950 text-orange-300 border border-orange-700 text-[10px] font-bold">kural ile çelişiyor</span>`
+    ? `<span class="px-2.5 py-1 rounded-full bg-[rgba(240,180,60,.14)] text-[#f3c265] border border-[rgba(240,180,60,.3)] text-[11px] font-bold">kural ile çelişiyor</span>`
     : "";
   const missing = (rc.missing_inputs || []).length
-    ? `<span class="text-slate-600">· veri yok: ${esc((rc.missing_inputs || []).join(", "))}</span>` : "";
+    ? `<span class="text-[#62676f]">· veri yok: ${esc((rc.missing_inputs || []).join(", "))}</span>` : "";
   box.innerHTML =
-    `<span class="text-slate-600 shrink-0">LLM:</span>` +
-    `<span class="font-semibold text-slate-300 shrink-0">${esc(rc.view || "—")}</span>` +
-    `<span class="text-slate-500 shrink-0">· güven ${Number(rc.confidence ?? 0).toFixed(2)}</span>` +
-    conflict +
-    `<span class="${stCls} truncate" title="${esc(rc.note || "")}">· ${esc(rc.note || "")}</span>` +
-    missing +
-    `<span class="ml-auto text-slate-700 shrink-0 font-mono">${esc(rc.model || "")} ${esc(hhmm(rc.ts))}</span>`;
+    `<div class="flex items-center gap-2.5 flex-none">
+       <span class="text-[10px] uppercase tracking-[.08em] font-bold text-[#7d838c]">LLM</span>
+       <span class="px-2.5 py-1 rounded-full bg-[rgba(216,250,90,.12)] text-[#d8fa5a] text-[13px] font-bold mono">${esc(rc.view || "—")}</span>
+       <span class="text-[13px] text-[#7d838c] mono">güven ${Number(rc.confidence ?? 0).toFixed(2)}</span>
+       ${conflict}
+     </div>
+     <p class="m-0 flex-1 min-w-[300px] text-[15px] leading-relaxed text-[#c8ced6]">${esc(rc.note || "—")}
+       <span class="${stCls} text-[13px]">${missing}</span>
+     </p>
+     <span class="text-[13px] text-[#62676f] mono flex-none">${esc(hhmm(rc.ts))}</span>`;
 }
 
 // ---- karar akışı -----------------------------------------------------------
@@ -323,28 +342,28 @@ function renderFeed(data) {
     ? `son ${rows.length} karar, en yeni üstte` + (data.skipped ? ` · ${data.skipped} bozuk satır atlandı` : "")
     : "";
   if (!rows.length) {
-    $("feed").innerHTML = `<div class="h-full flex items-center justify-center text-slate-600">henüz karar yok</div>`;
+    $("feed").innerHTML = `<div class="h-24 flex items-center justify-center rounded-[12px] bg-[#131417] text-[#62676f]">henüz karar yok</div>`;
     firstPaint = false;
     return;
   }
   $("feed").innerHTML = rows.map(r => {
     const k = key(r), isNew = !firstPaint && !seen.has(k), open = expanded.has(k);
     seen.add(k);
-    const gate = r.gate ? `<span class="opacity-70 font-mono">${esc(r.gate)}</span>` : "";
+    const gate = r.gate ? `<span class="mono text-[12.5px] text-[#7d838c]">${esc(r.gate)}</span>` : "";
     const llm = r.llm
-      ? `<span class="shrink-0 px-1 rounded border text-[10px] font-bold ${VERDICT_STYLE[r.llm.decision] || "bg-slate-800 text-slate-400 border-slate-700"}"
+      ? `<span class="shrink-0 px-2 py-0.5 rounded-[7px] border text-[11px] font-bold mono ${VERDICT_STYLE[r.llm.decision] || "bg-[rgba(255,255,255,.07)] text-[#b9bfc8] border-[rgba(255,255,255,.08)]"}"
                title="${esc(r.llm.reason || r.llm.note || "")}">${esc(r.llm.decision || r.llm.view || "llm")}</span>`
       : "";
     return `
-      <div class="rounded border border-slate-800 bg-slate-900/40 hover:bg-slate-800/50 cursor-pointer ${isNew ? "slide-in" : ""}" data-k="${esc(k)}">
-        <div class="flex items-baseline gap-2 px-2 py-1">
-          <span class="font-mono text-[11px] text-slate-500 shrink-0">${esc(hhmm(r.ts))}</span>
-          <span class="font-mono text-[11px] w-20 shrink-0 text-slate-300">${esc(r.symbol || "—")}</span>
-          <span class="shrink-0 px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide ${styleFor(r.action)}">${esc(r.action)}</span>
+      <div class="rounded-[12px] border border-[rgba(255,255,255,.04)] bg-[#141518] hover:bg-[#1a1c20] cursor-pointer transition-colors ${isNew ? "slide-in" : ""}" data-k="${esc(k)}">
+        <div class="flex flex-wrap items-center gap-2.5 px-4 py-3">
+          <span class="mono text-[13px] text-[#7d838c] shrink-0">${esc(hhmm(r.ts))}</span>
+          <span class="mono text-[13px] font-bold w-20 shrink-0 text-[#e6e9ee]">${esc(r.symbol || "—")}</span>
+          <span class="shrink-0 px-2.5 py-1 rounded-[7px] border text-[11.5px] font-extrabold tracking-[.06em] mono ${styleFor(r.action)}">${esc(r.action)}</span>
           ${gate}${llm}
-          <span class="truncate text-slate-400">${esc(r.reason || "")}</span>
+          <span class="truncate text-[13.5px] text-[#aeb4bd] mono">${esc(r.reason || "")}</span>
         </div>
-        <pre class="${open ? "" : "hidden"} mx-2 mb-2 p-2 rounded bg-black/60 text-[11px] text-slate-400 overflow-x-auto">${esc(JSON.stringify(r, null, 2))}</pre>
+        <pre class="${open ? "" : "hidden"} mx-4 mb-3 p-3 rounded-[10px] bg-[#0b0c0e] text-[11px] text-[#9aa0a8] overflow-x-auto">${esc(JSON.stringify(r, null, 2))}</pre>
       </div>`;
   }).join("");
   firstPaint = false;
@@ -363,32 +382,32 @@ function renderPositions(s) {
   const pos = s.positions || [], pend = s.pending || [];
   $("pos-meta").textContent = pos.length ? `${pos.length} açık${pend.length ? ` · ${pend.length} bekleyen` : ""}` : "";
   if (!pos.length && !pend.length) {
-    $("positions").innerHTML = `<div class="h-full flex items-center justify-center text-slate-600">pozisyon yok</div>`;
+    $("positions").innerHTML = `<div class="h-[100px] flex items-center justify-center rounded-[12px] bg-[#131417] text-[#62676f]">pozisyon yok</div>`;
     return;
   }
-  const head = `<tr class="text-[10px] uppercase tracking-wider text-slate-500">
-      <th class="text-left font-medium pb-1">parite</th><th class="text-right font-medium">giriş</th>
-      <th class="text-right font-medium">TP</th><th class="text-right font-medium">SL</th>
-      <th class="text-right font-medium">süre</th><th class="text-right font-medium">algoId</th></tr>`;
+  const head = `<tr class="text-[10px] uppercase tracking-wider text-[#7d838c]">
+      <th class="text-left font-bold pb-1.5">parite</th><th class="text-right font-bold">giriş</th>
+      <th class="text-right font-bold">TP</th><th class="text-right font-bold">SL</th>
+      <th class="text-right font-bold">süre</th><th class="text-right font-bold">algoId</th></tr>`;
   const body = pos.map(p => `
-      <tr class="border-t border-slate-800/70">
-        <td class="py-1 font-mono text-slate-200">${esc(p.pair)}</td>
-        <td class="text-right font-mono">${esc(p.entry_px)}</td>
-        <td class="text-right font-mono text-green-400">${esc(p.target)}</td>
-        <td class="text-right font-mono text-red-400">${esc(p.stop)}</td>
-        <td class="text-right text-slate-400">${dur(p.opened_ms)}</td>
-        <td class="text-right font-mono text-slate-500" title="${esc(p.algo_id || "")}">${esc(shortId(p.algo_id))}</td>
+      <tr class="border-t border-[rgba(255,255,255,.06)]">
+        <td class="py-2 mono text-[#e6e9ee]">${esc(p.pair)}</td>
+        <td class="text-right mono">${esc(p.entry_px)}</td>
+        <td class="text-right mono text-[#d8fa5a]">${esc(p.target)}</td>
+        <td class="text-right mono text-[#ff8a95]">${esc(p.stop)}</td>
+        <td class="text-right text-[#aeb4bd]">${dur(p.opened_ms)}</td>
+        <td class="text-right mono text-[#7d838c]" title="${esc(p.algo_id || "")}">${esc(shortId(p.algo_id))}</td>
       </tr>`).join("");
   const pending = pend.map(p => `
-      <tr class="border-t border-slate-800/70 text-slate-500">
-        <td class="py-1 font-mono">${esc(p.pair)}</td>
-        <td class="text-right font-mono">${esc(p.px)}</td>
-        <td class="text-right font-mono">${esc(p.target)}</td>
-        <td class="text-right font-mono">${esc(p.stop)}</td>
+      <tr class="border-t border-[rgba(255,255,255,.06)] text-[#7d838c]">
+        <td class="py-2 mono">${esc(p.pair)}</td>
+        <td class="text-right mono">${esc(p.px)}</td>
+        <td class="text-right mono">${esc(p.target)}</td>
+        <td class="text-right mono">${esc(p.stop)}</td>
         <td class="text-right">${dur(p.placed_ms)}</td>
         <td class="text-right text-[10px] uppercase">bekleyen</td>
       </tr>`).join("");
-  $("positions").innerHTML = `<table class="w-full text-[12px]">${head}${body}${pending}</table>`;
+  $("positions").innerHTML = `<table class="w-full text-[12.5px]">${head}${body}${pending}</table>`;
 }
 
 // Kapanan işlemler: kaynak state.json (ajan yazar), en yeni SONDA geldiği için ters çevrilir.
@@ -398,22 +417,22 @@ function renderClosed(s) {
   const rows = all.slice().reverse().slice(0, 5);
   $("ord-meta").textContent = all.length ? `toplam ${all.length}` : "";
   if (!rows.length) {
-    $("closed").innerHTML = `<div class="h-full flex items-center justify-center text-slate-600">henüz kapanan işlem yok</div>`;
+    $("closed").innerHTML = `<div class="h-[90px] flex items-center justify-center rounded-[12px] bg-[#131417] text-[#62676f]">henüz kapanan işlem yok</div>`;
     return;
   }
   $("closed").innerHTML = rows.map(c => {
     const net = c.net_bps, pnl = c.net_pnl_usdt;
-    const netCls = net == null ? "text-slate-500" : net > 0 ? "text-green-300" : net < 0 ? "text-red-300" : "text-slate-300";
+    const netCls = net == null ? "text-[#7d838c]" : net > 0 ? "text-[#d8fa5a]" : net < 0 ? "text-[#ff8a95]" : "text-[#ced3da]";
     const why = c.exit_reason || "—";
-    const wcls = EXIT_STYLE[why] || "bg-slate-800 text-slate-400 border-slate-700";
+    const wcls = EXIT_STYLE[why] || "bg-[rgba(255,255,255,.07)] text-[#b9bfc8] border-[rgba(255,255,255,.08)]";
     const tip = `giriş ${c.entry_px} → çıkış ${c.exit_px ?? "—"} · sz ${c.sz}` +
                 (c.gross_bps == null ? "" : ` · brüt ${c.gross_bps}bps − komisyon ${c.fee_bps}bps`);
-    return `<div class="flex items-baseline gap-2 px-1.5 py-1 rounded bg-slate-900/40 border border-slate-800" title="${esc(tip)}">
-        <span class="font-mono text-[11px] text-slate-500 shrink-0">${esc(hhmm(c.ts))}</span>
-        <span class="font-mono text-[11px] text-slate-300 shrink-0">${esc(c.pair || "—")}</span>
-        <span class="font-mono text-[11px] font-semibold shrink-0 ${netCls}">${net == null ? "—" : (net > 0 ? "+" : "") + net + " bps"}</span>
-        <span class="font-mono text-[10px] text-slate-500 shrink-0">${pnl == null ? "" : (pnl > 0 ? "+" : "") + pnl + " USDT"}</span>
-        <span class="ml-auto shrink-0 px-1.5 py-0.5 rounded border text-[10px] font-bold ${wcls}">${esc(why)}</span>
+    return `<div class="flex items-center gap-2.5 px-3.5 py-2.5 rounded-[12px] bg-[#141518] border border-[rgba(255,255,255,.04)]" title="${esc(tip)}">
+        <span class="mono text-[12.5px] text-[#7d838c] shrink-0">${esc(hhmm(c.ts))}</span>
+        <span class="mono text-[12.5px] text-[#e6e9ee] shrink-0">${esc(c.pair || "—")}</span>
+        <span class="mono text-[12.5px] font-bold shrink-0 ${netCls}">${net == null ? "—" : (net > 0 ? "+" : "") + net + " bps"}</span>
+        <span class="mono text-[11px] text-[#7d838c] shrink-0">${pnl == null ? "" : (pnl > 0 ? "+" : "") + pnl + " USDT"}</span>
+        <span class="ml-auto shrink-0 px-2 py-0.5 rounded-[7px] border text-[10.5px] font-bold mono ${wcls}">${esc(why)}</span>
       </div>`;
   }).join("");
 }
@@ -423,37 +442,37 @@ function renderLlm(data) {
   const rows = data.rows || [];
   $("llm-meta").textContent = rows.length ? `son ${rows.length} çağrı, en yeni üstte` : "";
   if (!rows.length) {
-    $("llm-rows").innerHTML = `<div class="h-full flex items-center justify-center text-slate-600">henüz LLM çağrısı yok</div>`;
+    $("llm-rows").innerHTML = `<div class="h-[90px] flex items-center justify-center rounded-[12px] bg-[#131417] text-[#62676f]">henüz LLM çağrısı yok</div>`;
     return;
   }
   $("llm-rows").innerHTML = rows.map(r => {
-    const taskCls = r.task === "judge" ? "bg-purple-950 text-purple-300 border-purple-800"
-                                       : "bg-blue-950 text-blue-300 border-blue-800";
+    const taskCls = r.task === "judge" ? "bg-[rgba(139,124,255,.14)] text-[#b3a6ff] border-[rgba(139,124,255,.22)]"
+                                       : "bg-[rgba(120,160,255,.14)] text-[#9fbcff] border-[rgba(120,160,255,.22)]";
     const stCls = LLM_STATUS_STYLE[r.status] || LLM_STATUS_STYLE.disabled;
     let verdict = "";
     if (r.verdict) {
       const mult = r.verdict === "REDUCE" && r.size_multiplier != null ? ` ×${r.size_multiplier}` : "";
-      verdict = `<span class="shrink-0 px-1.5 py-0.5 rounded border text-[10px] font-bold ${VERDICT_STYLE[r.verdict] || ""}">${esc(r.verdict)}${esc(mult)}</span>`;
+      verdict = `<span class="shrink-0 px-2 py-0.5 rounded-[7px] border text-[11px] font-bold mono ${VERDICT_STYLE[r.verdict] || ""}">${esc(r.verdict)}${esc(mult)}</span>`;
     } else if (r.view) {
-      verdict = `<span class="shrink-0 px-1.5 py-0.5 rounded border text-[10px] font-bold bg-slate-800 text-slate-300 border-slate-700">${esc(r.view)} ${Number(r.confidence ?? 0).toFixed(2)}</span>`;
+      verdict = `<span class="shrink-0 px-2 py-0.5 rounded-[7px] border text-[11px] font-bold mono bg-[rgba(255,255,255,.06)] text-[#dfe3e9] border-[rgba(255,255,255,.1)]">${esc(r.view)} ${Number(r.confidence ?? 0).toFixed(2)}</span>`;
     }
-    const conflict = r.conflict ? `<span class="shrink-0 text-[10px] font-bold text-orange-400">çelişki</span>` : "";
+    const conflict = r.conflict ? `<span class="shrink-0 text-[11px] font-bold text-[#f3c265]">çelişki</span>` : "";
     const missing = (r.missing_inputs || []).length
-      ? `<span class="shrink-0 text-[10px] text-slate-600" title="girdi aracı düştü, LLM yine çağrıldı">veri yok:${(r.missing_inputs || []).length}</span>` : "";
-    return `<div class="flex items-baseline gap-1.5 px-1.5 py-1 rounded bg-slate-900/40 border border-slate-800">
-        <span class="font-mono text-[11px] text-slate-500 shrink-0">${esc(hhmm(r.ts))}</span>
-        <span class="shrink-0 px-1 rounded border text-[10px] font-bold ${taskCls}">${esc(r.task || "?")}</span>
-        ${r.symbol ? `<span class="font-mono text-[11px] text-slate-300 shrink-0">${esc(r.symbol)}</span>` : ""}
-        <span class="shrink-0 px-1 rounded border text-[10px] font-bold ${stCls}">${esc(r.status || "?")}</span>
+      ? `<span class="shrink-0 text-[11px] text-[#62676f]" title="girdi aracı düştü, LLM yine çağrıldı">veri yok:${(r.missing_inputs || []).length}</span>` : "";
+    return `<div class="flex flex-wrap items-center gap-2 px-3.5 py-2.5 rounded-[12px] bg-[#141518] border border-[rgba(255,255,255,.04)]">
+        <span class="mono text-[13px] text-[#7d838c] shrink-0">${esc(hhmm(r.ts))}</span>
+        <span class="shrink-0 px-2 py-0.5 rounded-[7px] border text-[11px] font-bold mono ${taskCls}">${esc(r.task || "?")}</span>
+        ${r.symbol ? `<span class="mono text-[13px] text-[#e6e9ee] shrink-0">${esc(r.symbol)}</span>` : ""}
+        <span class="shrink-0 px-2 py-0.5 rounded-[7px] border text-[11px] font-bold mono ${stCls}">${esc(r.status || "?")}</span>
         ${verdict}${conflict}${missing}
-        <span class="truncate text-[11px] text-slate-400" title="${esc(r.text)}">${esc(r.text)}</span>
-        <span class="ml-auto shrink-0 font-mono text-[10px] text-slate-600" title="${esc(r.model || "")}">${r.latency_ms ?? "—"} ms</span>
+        <span class="truncate text-[13px] text-[#aeb4bd]" title="${esc(r.text)}">${esc(r.text)}</span>
+        <span class="ml-auto shrink-0 mono text-[11px] text-[#62676f]" title="${esc(r.model || "")}">${r.latency_ms ?? "—"} ms</span>
       </div>`;
   }).join("");
 }
 
 // ---- equity eğrisi ---------------------------------------------------------
-const GRID = "#1e293b", TICK = "#64748b";
+const GRID = "rgba(255,255,255,.06)", TICK = "#7d838c";
 let eqChart = null;
 
 function renderEquity(data) {
@@ -470,20 +489,21 @@ function renderEquity(data) {
     eqChart = new Chart($("eq-chart"), {
       type: "line",
       data: { labels, datasets: [
-        { label: "equity", data: series, borderColor: "#4ade80", backgroundColor: "rgba(74,222,128,.10)",
-          borderWidth: 1.6, pointRadius: 0, tension: .15, fill: true },
-        { label: "gün başı", data: ref, borderColor: "#64748b", borderWidth: 1,
+        { label: "equity", data: series, borderColor: "#d8fa5a", backgroundColor: "rgba(216,250,90,.14)",
+          borderWidth: 2, pointRadius: 0, tension: .15, fill: true },
+        { label: "gün başı", data: ref, borderColor: "#5b606a", borderWidth: 1,
           borderDash: [4, 4], pointRadius: 0, fill: false },
       ]},
       options: {
         responsive: true, maintainAspectRatio: false, animation: false,
         interaction: { mode: "index", intersect: false },
         plugins: { legend: { display: false },
-                   tooltip: { callbacks: { label: c => `${c.dataset.label}: ${Number(c.parsed.y).toFixed(4)} USDT` } } },
+                   tooltip: { backgroundColor: "#0e0f11", borderColor: "rgba(255,255,255,.1)", borderWidth: 1,
+                              callbacks: { label: c => `${c.dataset.label}: ${Number(c.parsed.y).toFixed(4)} USDT` } } },
         scales: {
           // gün başı tabanı 29,99 civarında; sıfırdan başlayan eksen çizgiyi düz gösterir.
-          y: { beginAtZero: false, grid: { color: GRID }, ticks: { color: TICK, font: { size: 9 }, maxTicksLimit: 4 } },
-          x: { grid: { display: false }, ticks: { color: TICK, font: { size: 9 }, maxTicksLimit: 6, autoSkip: true } },
+          y: { beginAtZero: false, grid: { color: GRID }, ticks: { color: TICK, font: { size: 10, family: "'JetBrains Mono', monospace" }, maxTicksLimit: 4 } },
+          x: { grid: { display: false }, ticks: { color: TICK, font: { size: 10, family: "'JetBrains Mono', monospace" }, maxTicksLimit: 6, autoSkip: true } },
         },
       },
     });
@@ -501,7 +521,7 @@ let microKey = "";
 
 // Alt şerit beş sütunluk tek satır. Evren 20 pariteye çıktığı için (Faz 7.5) burada
 // KIRPILIR — 20 canvas'ı 5 sütuna sığdırmak şeridi taşırıyordu; kaçının gösterildiği yazılır.
-const MICRO_CARDS = 5;
+const MICRO_CARDS = 8;
 
 function renderMicro(data) {
   const pairs = data.pairs || {};
@@ -511,7 +531,7 @@ function renderMicro(data) {
     ? `son ${data.minutes} dk` + (all.length > names.length ? ` · ${all.length} pariteden ilk ${names.length}` : "")
     : "";
   if (!names.length) {
-    $("micro-cards").innerHTML = `<div class="col-span-5 h-full flex items-center justify-center text-slate-600">mikro örnek yok</div>`;
+    $("micro-cards").innerHTML = `<div class="col-span-5 h-[110px] flex items-center justify-center rounded-[12px] bg-[#131417] text-[#62676f]">mikro örnek yok</div>`;
     return;
   }
   // kartlar bir kez kurulur; sonra yalnızca veri güncellenir
@@ -519,12 +539,12 @@ function renderMicro(data) {
     microKey = names.join(",");
     for (const n of Object.keys(microCharts)) { microCharts[n].destroy(); delete microCharts[n]; }
     $("micro-cards").innerHTML = names.map(n => `
-      <div class="min-w-0 min-h-0 overflow-hidden flex flex-col rounded bg-slate-950/50 border border-slate-800 px-1 pt-1 pb-0.5">
-        <div class="shrink-0 flex items-baseline gap-1">
-          <span class="font-mono text-[10px] text-slate-300 truncate">${esc(n.replace("-USDT", ""))}</span>
-          <span id="mb-${esc(n)}" class="ml-auto font-mono text-[9px] text-slate-500 shrink-0"></span>
+      <div class="min-w-0 rounded-[14px] bg-[#131417] border border-[rgba(255,255,255,.04)] px-3.5 py-3">
+        <div class="flex items-baseline gap-1.5">
+          <span class="mono text-[13px] font-bold text-[#e6e9ee] truncate">${esc(n.replace("-USDT", ""))}</span>
+          <span id="mb-${esc(n)}" class="ml-auto mono text-[12px] text-[#7d838c] shrink-0"></span>
         </div>
-        <div class="relative h-[78px] shrink-0"><canvas id="mc-${esc(n)}"></canvas></div>
+        <div class="relative h-[96px] mt-2.5"><canvas id="mc-${esc(n)}"></canvas></div>
       </div>`).join("");
   }
   for (const n of names) {
@@ -532,22 +552,23 @@ function renderMicro(data) {
     const obi = p.obi || [], spr = p.spread_bps || [], labels = (p.ts || []).map(hhmm);
     const badge = $(`mb-${n}`);
     if (badge) badge.innerHTML =
-      `<span class="${(p.last_obi ?? 0) >= 0 ? "text-green-400" : "text-red-400"}">${Number(p.last_obi ?? 0).toFixed(2)}</span>` +
-      ` <span class="text-sky-400">${Number(p.last_spread_bps ?? 0).toFixed(2)}</span>`;
+      `<span class="${(p.last_obi ?? 0) >= 0 ? "text-[#d8fa5a]" : "text-[#ff8a95]"}">${Number(p.last_obi ?? 0).toFixed(2)}</span>` +
+      ` <span class="text-[#3fd8e0]">${Number(p.last_spread_bps ?? 0).toFixed(2)}</span>`;
     if (!microCharts[n]) {
       const el = $(`mc-${n}`);
       if (!el) continue;
       microCharts[n] = new Chart(el, {
         type: "line",
         data: { labels, datasets: [
-          { label: "OBI", data: obi, borderColor: "#a78bfa", borderWidth: 1, pointRadius: 0, tension: .2, yAxisID: "y" },
-          { label: "spread bps", data: spr, borderColor: "#38bdf8", borderWidth: 1, pointRadius: 0, tension: .2, yAxisID: "y1" },
+          { label: "OBI", data: obi, borderColor: "#8b7cff", borderWidth: 1.2, pointRadius: 0, tension: .2, yAxisID: "y" },
+          { label: "spread bps", data: spr, borderColor: "#3fd8e0", borderWidth: 1.2, pointRadius: 0, tension: .2, yAxisID: "y1" },
         ]},
         options: {
           responsive: true, maintainAspectRatio: false, animation: false,
           interaction: { mode: "index", intersect: false },
           plugins: { legend: { display: false },
-                     tooltip: { callbacks: { label: c => `${c.dataset.label}: ${Number(c.parsed.y).toFixed(3)}` } } },
+                     tooltip: { backgroundColor: "#0e0f11", borderColor: "rgba(255,255,255,.1)", borderWidth: 1,
+                                callbacks: { label: c => `${c.dataset.label}: ${Number(c.parsed.y).toFixed(3)}` } } },
           // eksensiz sparkline; OBI (−1..1) ile spread (bps) farklı ölçekte, iki gizli y ekseni
           scales: { x: { display: false }, y: { display: false }, y1: { display: false } },
         },
@@ -571,10 +592,28 @@ const PRESETS = [
 const CHAT_KEEP = 6;          // her istekte gönderilen son mesaj sayısı (sunucu da kırpıyor)
 let chat = [];                // sayfada tutulan sohbet geçmişi
 let chatBusy = false;
+let streamingMsg = null;      // şu an yazı-yazıyor animasyonu oynatılan asistan mesajı
+
+// Sunucudan tek seferde gelen cevabı harf harf açan animasyon — gerçek token akışı değil
+// (backend /ask streaming desteklemiyor), yalnızca "yazıyor" hissi veren bir istemci efekti.
+function streamReveal(msg, fullText, onDone) {
+  const total = fullText.length;
+  const durationMs = Math.min(1800, Math.max(250, total * 10));
+  const start = performance.now();
+  function tick(now) {
+    const t = Math.min(1, (now - start) / durationMs);
+    msg.content = fullText.slice(0, Math.floor(total * t));
+    msg.streaming = t < 1;
+    renderChat();
+    if (t < 1) requestAnimationFrame(tick);
+    else { streamingMsg = null; onDone(); }
+  }
+  requestAnimationFrame(tick);
+}
 
 $("chat-presets").innerHTML = PRESETS.map((q, i) =>
-  `<button data-q="${esc(q)}" class="preset px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700
-            text-[10px] text-slate-300 transition-colors">${esc(i === 0 ? "Neden işlem yok?" : i === 1 ? "Bugünün kararları" : "SOL durumu")}</button>`).join("");
+  `<button data-q="${esc(q)}" class="preset px-3 py-1.5 rounded-full bg-transparent hover:bg-[rgba(255,255,255,.07)] border border-[rgba(255,255,255,.1)]
+            text-[13px] font-semibold text-[#ced3da] hover:text-white transition-colors">${esc(i === 0 ? "Neden işlem yok?" : i === 1 ? "Bugünün kararları" : "SOL durumu")}</button>`).join("");
 
 $("chat-presets").addEventListener("click", e => {
   const b = e.target.closest(".preset");
@@ -586,24 +625,26 @@ $("chat-input").addEventListener("keydown", e => { if (e.key === "Enter") askAge
 function renderChat() {
   const box = $("chat-log");
   if (!chat.length && !chatBusy) {
-    box.innerHTML = `<div class="h-full flex items-center justify-center text-center text-slate-600 px-3">
+    box.innerHTML = `<div class="h-full flex items-center justify-center text-center text-[#6b7078] px-3 leading-relaxed">
         Ajan kendi kararlarını loglardan anlatır.<br>Emir veremez, config değiştiremez.</div>`;
     return;
   }
   box.innerHTML = chat.map(m => {
     if (m.role === "user") {
-      return `<div class="flex justify-end"><div class="max-w-[92%] px-2 py-1 rounded bg-slate-700/70 text-slate-100">${esc(m.content)}</div></div>`;
+      return `<div class="flex justify-end"><div class="max-w-[92%] px-3 py-2 rounded-[10px] bg-[rgba(255,255,255,.09)] text-white">${esc(m.content)}</div></div>`;
     }
-    const cls = m.error ? "bg-red-950/60 border-red-800 text-red-200" : "bg-slate-950/60 border-slate-800 text-slate-200";
+    const cls = m.error ? "bg-[rgba(224,55,74,.1)] border-[rgba(224,55,74,.3)] text-[#ffb3ba]" : "bg-[#0e0f11] border-[rgba(255,255,255,.06)] text-[#dfe3e9]";
     const badges = (m.sources || []).map(s =>
-      `<span class="px-1 rounded bg-slate-800 border border-slate-700 text-[9px] text-slate-400">${esc(s)}</span>`).join(" ");
+      `<span class="px-1.5 rounded bg-[rgba(255,255,255,.06)] border border-[rgba(255,255,255,.1)] text-[9px] text-[#7d838c]">${esc(s)}</span>`).join(" ");
     const foot = m.error ? "" :
-      `<div class="mt-1 flex flex-wrap items-center gap-1">${badges}
-         <span class="ml-auto font-mono text-[9px] text-slate-600">${esc(m.model || "")} · ${m.latency_ms ?? "—"} ms${m.status && m.status !== "ok" ? ` · ${esc(m.status)}` : ""}</span>
+      `<div class="mt-1.5 flex flex-wrap items-center gap-1">${badges}
+         <span class="ml-auto mono text-[9px] text-[#62676f]">${esc(m.model || "")} · ${m.latency_ms ?? "—"} ms${m.status && m.status !== "ok" ? ` · ${esc(m.status)}` : ""}</span>
        </div>`;
-    return `<div class="px-2 py-1 rounded border ${cls} whitespace-pre-wrap">${esc(m.content)}${foot}</div>`;
-  }).join("") + (chatBusy
-    ? `<div class="px-2 py-1 rounded border border-slate-800 bg-slate-950/60 text-slate-500 pulse">düşünüyor…</div>` : "");
+    // stream sırasında yanıp sönen imleç — gerçek token akışı yok (tek /ask cevabı), yalnızca görsel his
+    const caret = m.streaming ? `<span class="inline-block w-[6px] h-[13px] -mb-[2px] ml-0.5 bg-[#d8fa5a] caret-blink"></span>` : "";
+    return `<div class="px-3 py-2 rounded-[10px] border ${cls} whitespace-pre-wrap">${esc(m.content)}${caret}${foot}</div>`;
+  }).join("") + (chatBusy && !streamingMsg
+    ? `<div class="px-3 py-2 rounded-[10px] border border-[rgba(255,255,255,.06)] bg-[#0e0f11] text-[#62676f] pulse-dot">düşünüyor…</div>` : "");
   box.scrollTop = box.scrollHeight;
 }
 
@@ -635,26 +676,33 @@ async function askAgent(question) {
     if (!res.ok) {
       chat.push({ role: "assistant", error: true,
                   content: `LLM yanıt vermedi (HTTP ${res.status}): ${data.detail || ""}` });
+      setChatBusy(false);
+      renderChat();
     } else {
-      chat.push({
-        role: "assistant", content: data.answer || "LLM yanıt vermedi.",
+      const full = data.answer || "LLM yanıt vermedi.";
+      const msg = {
+        role: "assistant", content: "", streaming: true,
         sources: data.sources, model: data.model, latency_ms: data.latency_ms,
         status: data.status, error: data.status === "failed_open" || data.status === "disabled",
-      });
+      };
+      chat.push(msg);
+      streamingMsg = msg;
+      renderChat();
+      streamReveal(msg, full, () => setChatBusy(false));
     }
   } catch (err) {
     chat.push({ role: "assistant", error: true, content: `LLM yanıt vermedi (ağ hatası): ${err}` });
+    setChatBusy(false);
+    renderChat();
   }
-  setChatBusy(false);
-  renderChat();
 }
 
 // ---- kontroller ------------------------------------------------------------
-// Seviye adı → rozet rengi: temkinli yeşil (en az risk) · dengeli sarı · agresif kırmızı.
+// Seviye adı → rozet rengi: temkinli lime (en az risk) · dengeli amber · agresif kırmızı.
 const LEVEL_STYLE = {
-  cautious:   "bg-green-950 text-green-300 border border-green-800",
-  balanced:   "bg-yellow-950 text-yellow-300 border border-yellow-800",
-  aggressive: "bg-red-950 text-red-300 border border-red-800",
+  cautious:   "bg-[rgba(216,250,90,.1)] border-[rgba(216,250,90,.25)] text-[#d8fa5a]",
+  balanced:   "bg-[rgba(240,180,60,.1)] border-[rgba(240,180,60,.3)] text-[#f3c265]",
+  aggressive: "bg-[rgba(224,55,74,.12)] border-[rgba(224,55,74,.35)] text-[#ff8a95]",
 };
 const LEVEL_LABEL = { cautious: "Temkinli", balanced: "Dengeli", aggressive: "Agresif" };
 let levelKey = "";
@@ -670,14 +718,14 @@ function renderRiskLevels(s) {
                     ` · günlük tavan ${p.max_daily_trades} · kill ${p.kill_switch_daily_pct}%` +
                     ` · cooldown ${Math.round(Number(p.cooldown_sec) / 60)} dk`;
       return `<button data-level="${esc(n)}" title="${esc(title)}"
-                class="risk-level px-2 py-0.5 rounded font-mono text-[11px] border transition-colors">${esc(LEVEL_LABEL[n] || n)}</button>`;
+                class="risk-level px-3 py-1.5 rounded-full mono text-[12px] font-semibold border transition-colors">${esc(LEVEL_LABEL[n] || n)}</button>`;
     }).join("");
   }
   for (const b of document.querySelectorAll(".risk-level")) {
     const on = b.dataset.level === active;
-    b.className = "risk-level px-2 py-0.5 rounded font-mono text-[11px] border transition-colors " +
-      (on ? (LEVEL_STYLE[b.dataset.level] || "bg-slate-100 text-slate-900 border-slate-300") + " font-semibold"
-          : "bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-400");
+    b.className = "risk-level px-3 py-1.5 rounded-full mono text-[12px] font-semibold border transition-colors " +
+      (on ? (LEVEL_STYLE[b.dataset.level] || "bg-[rgba(255,255,255,.9)] text-black border-transparent") + " font-extrabold"
+          : "bg-[rgba(255,255,255,.04)] hover:bg-[rgba(255,255,255,.08)] border-[rgba(255,255,255,.08)] text-[#7d838c]");
   }
 }
 
@@ -691,37 +739,23 @@ function renderControl(s) {
   const mode = (s.control || {}).mode || "run";
   const badge = $("mode-badge");
   badge.textContent = mode;
-  badge.className = "px-2 py-0.5 rounded font-mono font-semibold " + (
-    mode === "run"   ? "bg-green-950 text-green-300 border border-green-800" :
-    mode === "pause" ? "bg-yellow-950 text-yellow-300 border border-yellow-800" :
-                       "bg-red-950 text-red-300 border border-red-800");
+  badge.className = "px-3 py-1.5 rounded-full font-bold text-[13px] mono border " + (
+    mode === "run"   ? "bg-[rgba(216,250,90,.12)] text-[#d8fa5a] border-[rgba(216,250,90,.25)]" :
+    mode === "pause" ? "bg-[rgba(240,180,60,.14)] text-[#f3c265] border-[rgba(240,180,60,.3)]" :
+                       "bg-[rgba(224,55,74,.14)] text-[#ff8a95] border-[rgba(224,55,74,.3)]");
   $("flatten-badge").classList.toggle("hidden", !(s.control || {}).flatten);
 
   const btn = $("btn-toggle");
   if (mode === "pause") {
     btn.textContent = "Devam";
-    btn.className = "px-4 py-1.5 rounded font-semibold bg-green-800 hover:bg-green-700 text-green-50 transition-colors";
+    btn.className = "px-5 py-3 rounded-full font-extrabold text-[14px] bg-[#d8fa5a] hover:bg-[#e6ff86] text-black transition-colors";
     btn.dataset.next = "run";
   } else {
     btn.textContent = "Duraklat";
-    btn.className = "px-4 py-1.5 rounded font-semibold bg-slate-700 hover:bg-slate-600 transition-colors";
+    btn.className = "px-5 py-3 rounded-full font-bold text-[14px] bg-[rgba(255,255,255,.06)] border border-[rgba(255,255,255,.12)] text-[#e6e9ee] hover:bg-[rgba(255,255,255,.12)] transition-colors";
     btn.dataset.next = "pause";
   }
 }
-
-let modalAction = null;
-function openModal(title, body, okLabel, okCls, action) {
-  $("modal-title").textContent = title;
-  $("modal-body").textContent = body;
-  $("modal-ok").textContent = okLabel;
-  $("modal-ok").className = "px-4 py-1.5 rounded font-semibold " + okCls;
-  modalAction = action;
-  $("modal").classList.remove("hidden");
-}
-const closeModal = () => { $("modal").classList.add("hidden"); modalAction = null; };
-$("modal-cancel").onclick = closeModal;
-$("modal").onclick = e => { if (e.target === $("modal")) closeModal(); };
-$("modal-ok").onclick = async () => { const a = modalAction; closeModal(); if (a) await send(a); };
 
 async function send(body) {
   try {
@@ -737,14 +771,6 @@ async function send(body) {
 }
 
 $("btn-toggle").onclick = () => send({ mode: $("btn-toggle").dataset.next });
-$("btn-kill").onclick = () => openModal(
-  "Acil Durdur",
-  "Ajan döngüsü temiz biçimde duracak; açık pozisyonlar kapatılmaz, borsadaki TP/SL emirleri onları korumaya devam eder.",
-  "Durdur", "bg-red-700 hover:bg-red-600 text-white", { mode: "kill", confirm: true });
-$("btn-flatten").onclick = () => openModal(
-  "Tümünü Kapat",
-  "Açık tüm pozisyonlar piyasa emriyle kapatılacak ve bekleyen emirler iptal edilecek. Bu işlem geri alınamaz.",
-  "Hepsini kapat", "bg-amber-600 hover:bg-amber-500 text-white", { flatten: true, confirm: true });
 
 // ---- poll ------------------------------------------------------------------
 // Sohbet kutusu bu döngüde YENİDEN ÇİZİLMEZ — yazılan metin ve gelen cevap kaybolmaz.
@@ -762,14 +788,16 @@ async function tick() {
     ]);
     inflight = null;
     $("conn").classList.add("hidden");
+    $("conn-live").classList.remove("hidden");
     if (s.poll_sec) pollMs = s.poll_sec * 1000;
-    renderCards(s); renderRegimeLlm(s); renderControl(s); renderPositions(s);
+    renderCards(s); renderHeaderMeta(s); renderRegimeLlm(s); renderControl(s); renderPositions(s);
     renderFeed(feed); renderClosed(s); renderLlm(llm);
     renderEquity(equity); renderMicro(micro);
   } catch (err) {
     if (err.name === "AbortError") return;
     inflight = null;
     $("conn").classList.remove("hidden");   // son iyi veri ekranda kalır
+    $("conn-live").classList.add("hidden");
   }
 }
 
