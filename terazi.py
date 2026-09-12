@@ -556,10 +556,25 @@ class Agent:
             self.state.day_start_equity = self.state.equity
             self.state.trade_day = datetime.now(tz=self.tz).strftime("%Y-%m-%d")
             self.state.daily_pnl_pct = 0.0
+            # Kill switch günlük zarar bayrağıdır; gün başı tabanı yenilenince o da düşer.
+            self.state.kill_switch = False
             print(f"gün başı equity = {self.state.equity} (profil {self.t.profile})")
             self.decide("WAIT", gate="day_start",
                         reason=f"gün başı equity {self.state.equity} olarak {self.t.profile} "
-                               f"bakiyesinden alındı; günlük PnL sıfırlandı")
+                               f"bakiyesinden alındı; günlük PnL ve kill switch sıfırlandı")
+
+        # Acil Durdur ÇALIŞAN DÖNGÜYÜ durdurur; YENİDEN BAŞLATMAYI ENGELLEMEZ. control.json'da
+        # kalan mode=kill bir kerelik tüketilir, yoksa ajan her açılışta ilk turda kendini öldürür.
+        ctl = read_control()
+        if ctl["mode"] == "kill":
+            CONTROL.write_text(
+                json.dumps({"mode": "run", "flatten": ctl["flatten"]}, indent=2), encoding="utf-8"
+            )
+            self.decide("OPERATOR_KILL_CLEARED",
+                        reason="control.json'da mode=kill bulundu; bir kerelik tüketildi → run. "
+                               "Acil Durdur döngüyü durdurur, yeniden başlatmayı engellemez.")
+            print("control.json mode=kill tüketildi → run")
+
         # Borsa kaynak gerçek: state.json ne derse desin önce uzlaştır.
         await self.reconcile(startup=True)
 
@@ -859,9 +874,13 @@ class Agent:
         if not orders_allowed:
             return False, "control", "operatör: emir yok (pause/kill)", zero, zero
 
-        # 1 kill switch
-        if self.state.kill_switch or self.state.daily_pnl_pct <= r.kill_switch_daily_pct:
+        # 1 kill switch — YALNIZCA günlük zarar. Bayrağın tek yazarı burasıdır; operatör kill
+        # (tick()) artık buraya yazmaz. İkisi ayrı kavram: bu "bugün bitti" (kalıcı risk kararı),
+        # o "döngüyü durdur" (geçici süreç kararı). Karışınca operatör kill kalıcılığı miras
+        # alıyor ve ajan yeniden başlatıldığında emir yolu sessizce kapalı kalıyordu.
+        if self.state.daily_pnl_pct <= r.kill_switch_daily_pct:
             self.state.kill_switch = True
+        if self.state.kill_switch:
             return False, "risk_kill_switch", \
                 f"günlük PnL {self.state.daily_pnl_pct:.2f}% ≤ {r.kill_switch_daily_pct}%", zero, zero
         # 2 cooldown
@@ -1263,7 +1282,8 @@ class Agent:
             # Acil Durdur: döngü TEMİZ çıkar. Pozisyonlar kapatılmaz — borsadaki TP/SL onları
             # korumaya devam eder; hepsini kapatmak ayrı bir eylem (flatten).
             # "Ajan asla durmaz" kuralı HATALAR için; operatör komutu bunun dışındadır.
-            self.state.kill_switch = True
+            # state.kill_switch'e YAZILMAZ: o günlük zarar bayrağı, bu süreç komutu. Yazılırsa
+            # durum dosyasında kalıcılaşır ve yeniden başlatılan ajan hiç emir gönderemez.
             self.state.last_turn_ms = now_ms()
             self.state.save()
             self.decide("OPERATOR_KILL",
