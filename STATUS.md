@@ -55,10 +55,25 @@ uzlaştırma döngüsünün bel bağladığı varsayım artık ölçülmüş ger
 22. **Gerçek spread varsayımdan 150× küçük.** Ölçülen BTC medyanı **0,013 bps**, varsayım 2 bps idi.
     Maliyet kapısı 45,0 bps yerine ~40,0 bps'e iniyor, yani kalibrasyon tablosundan **daha
     geçirgen**. Kalibrasyonun "spread 2 bps" varsayımı muhafazakâr çıktı.
-23. **Kapıda reddedilen aday paritenin ufkunu tüketiyor.** `SetupTracker` tetikte HOLDING'e geçtiği
-    için, aday sonradan mikro/maliyet/risk kapısında reddedilse de o parite 12 mum yeni kurulum
-    aramıyor. Bu **bilinçli**: kalibrasyonun "tetiklenen kurulum ufku tüketir" semantiği ile canlı
-    aynı kalsın diye. Yön muhafazakâr (canlı daha az işlem yapar), ama bilinmesi gerekiyor.
+23. **~~Kapıda reddedilen aday paritenin ufkunu tüketiyor.~~ DÜZELTİLDİ** (canlıya geçmeden,
+    12 Eylül 09:18 UTC). Eskiden `SetupTracker` tetik anında HOLDING'e geçtiği için, aday sonradan
+    mikro/maliyet/risk/judge kapısında reddedilse bile o parite 12 mum boyunca yeni kurulum
+    aramıyordu — bir mikro gürültüsü paritenin 3 saatini yiyordu.
+    **Yeni davranış:** tetik `PENDING` durumuna geçirir; ufuk ancak **emir gönderilince**
+    (`confirm()`) tüketilir, **herhangi bir kapı reddederse** (`reject()`) tracker `IDLE`'a döner ve
+    parite **bir sonraki mumda** yeni kurulum arayabilir. Bu, sınıfta zaten var olan
+    "stop bandı reddi ufuk tüketmez" kuralıyla tutarlı hâle geldi.
+    `PENDING` çözülmeden `step()` çağrılırsa `RuntimeError` atar — sıra hatası sessiz kalamaz;
+    `terazi.py` bu yüzden adayı mumun kendi döngüsü içinde çözüyor.
+    **Kalibrasyon etkilenmedi:** backtest'te kapı olmadığı için `scan()` her tetikte `confirm()`
+    çağırıyor. Sabit sentetik veride eski/yeni semantik üç eşikte de birebir aynı çıktı
+    (kurulum/tetik/kazanç/kayıp/zaman aşımı/maliyet✓ tamamı eşit) ve gerçek tablo yeniden
+    üretildiğinde **15 sonuç satırının hepsi değişmeden kaldı** — yalnızca hacim ve RSI çapraz
+    kontrol sayıları oynadı, o da 35 dk daha yeni veri penceresinden.
+    Öz-testler 7 → **9 vakaya** çıktı: "tetik + kapı reddi → IDLE" ve "PENDING çözülmeden
+    step() → RuntimeError".
+    **Kalan davranış:** emir gönderilip 90 sn'de dolmazsa ufuk yine tüketilmiş olur (emir gitti
+    sayılır). Bunu gevşetmek istersen Faz 7'de konuşulmalı.
 24. Demo testinde mikro kapısı bir adayı gerçekten reddetti (OBI −0,025 < 0) — kapıların sahte
     olmadığının kanıtı; ikinci denemede OBI +0,130 ile geçti.
 

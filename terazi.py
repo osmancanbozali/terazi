@@ -660,40 +660,49 @@ class Agent:
             if df.empty:
                 continue
             new = df[df["ts"] > self.state.last_signal_bar_ts] if self.state.last_signal_bar_ts else df.tail(1)
-            events: list[tuple[str, Any]] = []
-            for row in new.itertuples():
-                bar = Bar(int(row.ts), row.high, row.low, row.close,
-                          row.bb_lower, row.bb_mid, row.rsi, row.atr)
-                for ev in self.trackers[pair].step(bar):
-                    events.append((ev.kind, ev))
-            last = df.iloc[-1]
 
             # Açık pozisyonların mum sayacı: zaman stopu kapanmış mumla ölçülür.
             for pos in self.state.positions:
                 if pos.pair == pair:
                     pos.bars_held += len(new)
 
-            for kind, ev in events:
-                if kind is Ev.SETUP:
-                    self.decide("SETUP", symbol=pair, price=float(last.close),
-                                rsi=round(float(last.rsi), 2), bb_lower=float(last.bb_lower),
-                                bb_mid=float(last.bb_mid), reason="kurulum: BB alt + RSI eşik altı")
-                elif kind is Ev.CANCEL:
-                    self.decide("WAIT", symbol=pair, gate="trigger",
-                                reason=f"{self.cfg.signal.trigger_window} mumda tetik gelmedi, kurulum iptal")
-                elif kind is Ev.REJECT_STOP:
-                    self.decide("REJECT", symbol=pair, gate="risk_stop_band",
-                                reason=f"stop mesafesi {ev.detail['stop_bps']:.1f}bps > "
-                                       f"{self.cfg.risk.max_stop_bps}bps")
-                elif kind is Ev.TRIGGER and not ev.detail.get("rejected"):
-                    if await self._handle_candidate(pair, ev, last, orders_allowed):
-                        acted = True
+            # Olaylar mum mum çözülür: tetik PENDING bırakır ve `step()` PENDING'de hata atar,
+            # yani aday AYNI turda kapılardan geçirilmek ZORUNDA. Sıra hatası sessiz kalamaz.
+            tracker = self.trackers[pair]
+            for row in new.itertuples():
+                bar = Bar(int(row.ts), row.high, row.low, row.close,
+                          row.bb_lower, row.bb_mid, row.rsi, row.atr)
+                for ev in tracker.step(bar):
+                    if ev.kind is Ev.SETUP:
+                        self.decide("SETUP", symbol=pair, price=float(row.close),
+                                    rsi=round(float(row.rsi), 2), bb_lower=float(row.bb_lower),
+                                    bb_mid=float(row.bb_mid),
+                                    reason="kurulum: BB alt + RSI eşik altı")
+                    elif ev.kind is Ev.CANCEL:
+                        self.decide("WAIT", symbol=pair, gate="trigger",
+                                    reason=f"{self.cfg.signal.trigger_window} mumda tetik gelmedi, "
+                                           "kurulum iptal")
+                    elif ev.kind is Ev.REJECT_STOP:
+                        self.decide("REJECT", symbol=pair, gate="risk_stop_band",
+                                    reason=f"stop mesafesi {ev.detail['stop_bps']:.1f}bps > "
+                                           f"{self.cfg.risk.max_stop_bps}bps")
+                    elif ev.kind is Ev.TRIGGER and not ev.detail.get("rejected"):
+                        placed = await self._handle_candidate(pair, ev, row, orders_allowed)
+                        # Emir gönderildiyse ufuk tüketilir; herhangi bir kapı reddettiyse
+                        # tracker IDLE'a döner ve bu parite SONRAKİ mumda yeni kurulum arar.
+                        if tracker.pending:
+                            tracker.confirm() if placed else tracker.reject()
+                        acted = acted or placed
         return acted
 
     async def _handle_candidate(
-        self, pair: str, ev: Any, last: Any, orders_allowed: bool
+        self, pair: str, ev: Any, bar_row: Any, orders_allowed: bool
     ) -> bool:
-        """Aday: judge → mikro teyit → maliyet kapısı → risk kapısı → emir. Sıra ATLANMAZ."""
+        """Aday: judge → mikro teyit → maliyet kapısı → risk kapısı → emir. Sıra ATLANMAZ.
+
+        True  = emir gönderildi → çağıran `tracker.confirm()` yapar, ufuk tüketilir.
+        False = bir kapı reddetti → çağıran `tracker.reject()` yapar, ufuk TÜKETİLMEZ.
+        """
         dt = self.cfg.demo_test
         entry_ref = Decimal(str(ev.detail["entry"]))
         target = Decimal(str(ev.detail["target"]))
@@ -707,8 +716,8 @@ class Agent:
 
         micro = self.micro_last.get(pair, {})
         base = {
-            "symbol": pair, "price": float(last.close), "rsi": round(float(last.rsi), 2),
-            "bb_lower": float(last.bb_lower), "bb_mid": float(last.bb_mid),
+            "symbol": pair, "price": float(bar_row.close), "rsi": round(float(bar_row.rsi), 2),
+            "bb_lower": float(bar_row.bb_lower), "bb_mid": float(bar_row.bb_mid),
             "obi": micro.get("obi"), "spread_bps": micro.get("spread_bps"),
             "target_bps": round(target_bps, 1), "stop_bps": round(stop_bps, 1),
         }

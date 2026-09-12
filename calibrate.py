@@ -70,8 +70,14 @@ class SetupTracker:
     İlerleme kuralları (asimetrik, kullanıcı kararı):
       - Tetiklenmeyen kurulum: 2 mum sonra iptal. İptal mumu yeni kurulum SAYILMAZ,
         ama ondan SONRAKİ mum yeni kurulum olabilir (tetik penceresi yenilenir).
-      - Tetiklenen kurulum: 8 mumluk ufku tüketir; ufuk bitene kadar yeni kurulum aranmaz.
-      - Stop bandı reddi: ufuk tüketilmez, sonraki mum yeni kurulum olabilir.
+      - Tetik ufku HEMEN tüketmez: tetikten sonra durum **PENDING**'dir. Aday kapıları
+        geçip emir gönderilirse `confirm()` → HOLDING, ufuk tüketilir. Herhangi bir kapı
+        (mikro / maliyet / risk / judge) reddederse `reject()` → IDLE, ufuk TÜKETİLMEZ ve
+        sonraki mum yeni kurulum olabilir.
+      - Stop bandı reddi: aynı mantık, ufuk tüketilmez (bu red `_open` içinde kendiliğinden
+        IDLE'a döner, ayrıca `reject()` gerekmez).
+
+    PENDING çözülmeden `step()` çağrılırsa hata atar — sessiz sıra hatası olmaz.
     """
 
     def __init__(
@@ -112,8 +118,31 @@ class SetupTracker:
             return True
         return bar.close < bar.bb_lower and bar.rsi < self.rsi_threshold
 
+    @property
+    def pending(self) -> bool:
+        """Tetik geldi, kapıların sonucu bekleniyor. `confirm()` ya da `reject()` şart."""
+        return self._state == "PENDING"
+
+    def confirm(self) -> None:
+        """Aday tüm kapıları geçti ve emir gönderildi → ufuk tüketilmeye başlar."""
+        if self._state != "PENDING":
+            raise RuntimeError(f"confirm() PENDING dışında çağrıldı (state={self._state})")
+        self._state = "HOLDING"
+        self._held = 0
+
+    def reject(self) -> None:
+        """Aday bir kapıda reddedildi → ufuk TÜKETİLMEZ, sonraki mum yeni kurulum olabilir."""
+        if self._state != "PENDING":
+            raise RuntimeError(f"reject() PENDING dışında çağrıldı (state={self._state})")
+        self._reset()
+
     def step(self, bar: Bar) -> list[Event]:
         """Bir mumu işler, o mumda oluşan olayları döndürür (0..2 olay)."""
+        if self._state == "PENDING":
+            raise RuntimeError(
+                "SetupTracker PENDING durumda yeni mum aldı: tetik kapılarla çözülmemiş. "
+                "TRIGGER sonrası confirm() veya reject() çağır."
+            )
         if np.isnan(bar.bb_lower) or np.isnan(bar.rsi) or np.isnan(bar.atr):
             return []  # ısınma bölgesi
 
@@ -190,8 +219,8 @@ class SetupTracker:
         self._stop = entry * (1.0 - stop_bps / 10_000.0)
         self._target = target
         self._entry = entry
-        self._state = "HOLDING"
-        self._held = 0
+        # HOLDING'e DEĞİL, PENDING'e geçilir: ufuk ancak emir gönderilince tüketilir.
+        self._state = "PENDING"
         trig.detail["stop_bps"] = stop_bps
         return [trig]
 
@@ -332,6 +361,9 @@ def scan(bars: list[Bar], threshold: float, args: argparse.Namespace, gate_bps: 
                     st.stop_bps.append(ev.detail["stop_bps"])
                     pending_naive = {"target": ev.detail["target"]}
                     naive_left = args.target_horizon
+                    # Backtest'te kapı yok: tetik = emir gönderildi. Canlıda bu çağrıyı
+                    # `terazi.py` yalnızca 5 kapının hepsi geçtiğinde yapar.
+                    tr.confirm()
             elif ev.kind is Ev.REJECT_STOP:
                 st.stop_rejects += 1
             elif ev.kind is Ev.WIN:
@@ -387,9 +419,15 @@ def self_test(args: argparse.Namespace) -> list[str]:
     flat = lambda ts: mk(ts, 100.50, 100.40, 100.60, rsi=40)  # noqa: E731 — ne stop ne hedef
 
     def check(name: str, seq: list[Bar], expect: list[Ev]) -> None:
+        """Tetikte confirm() çağırır — backtest'te kapı yok, tetik = emir gönderildi."""
         nonlocal failed
         tr = tracker()
-        got = [ev.kind for b in seq for ev in tr.step(b)]
+        got: list[Ev] = []
+        for b in seq:
+            for ev in tr.step(b):
+                got.append(ev.kind)
+            if tr.pending:
+                tr.confirm()
         ok = got == expect
         failed = failed or not ok
         out.append(f"  {'OK  ' if ok else 'HATA'} {name}: {[k.value for k in got]}")
@@ -422,6 +460,32 @@ def self_test(args: argparse.Namespace) -> list[str]:
     check("stop bandı reddi ufuk tüketmez",
           [mk(0, 90.0, 89.0, 91.0), trig(1), setup(2)],
           [Ev.SETUP, Ev.TRIGGER, Ev.REJECT_STOP, Ev.SETUP])
+
+    # H) tetik + KAPI REDDİ → IDLE: ufuk tüketilmez, sonraki mum yeni kurulum olabilir.
+    #    Canlıda mikro/maliyet/risk/judge kapılarından biri reddettiğinde bu yol işler.
+    tr = tracker()
+    got_h = [ev.kind for ev in tr.step(setup(0))]
+    got_h += [ev.kind for ev in tr.step(trig(1))]
+    ok_h = tr.pending  # tetik sonrası HOLDING değil PENDING olmalı
+    tr.reject()        # bir kapı reddetti
+    ok_h = ok_h and tr._state == "IDLE"
+    got_h += [ev.kind for ev in tr.step(setup(2))]  # hemen sonraki mum yeni kurulum
+    ok_h = ok_h and got_h == [Ev.SETUP, Ev.TRIGGER, Ev.SETUP]
+    failed = failed or not ok_h
+    out.append(f"  {'OK  ' if ok_h else 'HATA'} tetik + kapı reddi → IDLE, ufuk tüketilmez: "
+               f"{[k.value for k in got_h]}")
+
+    # I) PENDING çözülmeden step() çağrılırsa hata atar (sessiz sıra hatası olmaz)
+    tr = tracker()
+    tr.step(setup(0))
+    tr.step(trig(1))
+    try:
+        tr.step(flat(2))
+        ok_i = False
+    except RuntimeError:
+        ok_i = True
+    failed = failed or not ok_i
+    out.append(f"  {'OK  ' if ok_i else 'HATA'} PENDING çözülmeden step() → RuntimeError")
 
     # G) stop %0,5'ten yakınsa 50 bps'e çekilir; ham stop'un altındaki mum artık kayıp değil
     tr = tracker()

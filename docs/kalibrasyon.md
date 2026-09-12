@@ -1,14 +1,14 @@
 # Kalibrasyon — RSI eşik taraması
 
-Üretildi: `calibrate.py`, 2026-09-12 08:42 UTC · profil `hackathon` · `capabilities.demo` = **False** · emir gönderilmedi.
+Üretildi: `calibrate.py`, 2026-09-12 09:18 UTC · profil `hackathon` · `capabilities.demo` = **False** · emir gönderilmedi.
 
 Veri: 3 gün × 15m, parite başına 288 kapanmış mum (+120 ısınma). Kapanmamış mum (`confirm=0`) atıldı.
 
-- BTC-USDT: 407 kapanmış mum (2026-09-08 02:45 → 2026-09-12 08:15 UTC), tekrar eden ts=0, boşluk=0
-- ETH-USDT: 407 kapanmış mum (2026-09-08 02:45 → 2026-09-12 08:15 UTC), tekrar eden ts=0, boşluk=0
-- SOL-USDT: 407 kapanmış mum (2026-09-08 02:45 → 2026-09-12 08:15 UTC), tekrar eden ts=0, boşluk=0
-- XRP-USDT: 407 kapanmış mum (2026-09-08 02:45 → 2026-09-12 08:15 UTC), tekrar eden ts=0, boşluk=0
-- DOGE-USDT: 407 kapanmış mum (2026-09-08 02:45 → 2026-09-12 08:15 UTC), tekrar eden ts=0, boşluk=0
+- BTC-USDT: 407 kapanmış mum (2026-09-08 03:30 → 2026-09-12 09:00 UTC), tekrar eden ts=0, boşluk=0
+- ETH-USDT: 407 kapanmış mum (2026-09-08 03:30 → 2026-09-12 09:00 UTC), tekrar eden ts=0, boşluk=0
+- SOL-USDT: 407 kapanmış mum (2026-09-08 03:30 → 2026-09-12 09:00 UTC), tekrar eden ts=0, boşluk=0
+- XRP-USDT: 407 kapanmış mum (2026-09-08 03:30 → 2026-09-12 09:00 UTC), tekrar eden ts=0, boşluk=0
+- DOGE-USDT: 407 kapanmış mum (2026-09-08 03:30 → 2026-09-12 09:00 UTC), tekrar eden ts=0, boşluk=0
 
 Ücret ölçüldü: `account_get_trade_fee` maker `-0.0008` → **abs = 8.0 bps**. Maliyet = 2×8.0 + 2 spread = **18.0 bps**. Kapı = 2.5 × maliyet = **45.0 bps**.
 
@@ -16,21 +16,21 @@ Veri: 3 gün × 15m, parite başına 288 kapanmış mum (+120 ısınma). Kapanma
 
 | parite | hacim sırası | volUsd24h |
 |---|---|---|
-| BTC-USDT | 2 | 570,260,582 |
-| ETH-USDT | 1 | 640,993,269 |
-| SOL-USDT | 4 | 118,894,533 |
-| XRP-USDT | 6 | 57,040,808 |
-| DOGE-USDT | 7 | 44,460,936 |
+| BTC-USDT | 2 | 570,026,662 |
+| ETH-USDT | 1 | 641,382,206 |
+| SOL-USDT | 4 | 118,799,978 |
+| XRP-USDT | 6 | 56,760,026 |
+| DOGE-USDT | 7 | 44,250,320 |
 
 ## RSI çapraz kontrolü — bizim Wilder(14) vs `market_get_indicator`
 
 | parite | örtüşen nokta | max Δ (tümü) | ort Δ (tümü) | max Δ (son 50) | ort Δ (son 50) |
 |---|---|---|---|---|---|
-| BTC-USDT | 99 | 3.634 | 0.247 | 0.0147 | 0.0049 |
-| ETH-USDT | 99 | 3.843 | 0.303 | 0.0175 | 0.0057 |
-| SOL-USDT | 99 | 3.561 | 0.274 | 0.0416 | 0.0089 |
-| XRP-USDT | 99 | 3.552 | 0.308 | 0.0164 | 0.0082 |
-| DOGE-USDT | 99 | 3.894 | 0.317 | 0.0140 | 0.0070 |
+| BTC-USDT | 99 | 2.714 | 0.189 | 0.0215 | 0.0066 |
+| ETH-USDT | 99 | 3.453 | 0.202 | 0.0226 | 0.0094 |
+| SOL-USDT | 99 | 2.417 | 0.207 | 0.0187 | 0.0054 |
+| XRP-USDT | 99 | 2.592 | 0.272 | 0.0191 | 0.0055 |
+| DOGE-USDT | 99 | 2.475 | 0.217 | 0.0262 | 0.0057 |
 
 **Sonuç: RSI'ımız doğru.** Fark bir *ısınma artefaktıdır*, formül farkı değil.
 `market_get_indicator` `returnList` 100 noktada tavan yapıyor ve OKX Wilder ortalamasını
